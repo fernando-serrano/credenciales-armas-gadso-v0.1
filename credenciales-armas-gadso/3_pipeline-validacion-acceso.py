@@ -15,7 +15,27 @@ load_dotenv()
 URL_INSCRIPCION = "https://www.sucamec.gob.pe/sel/faces/pub/inscripcionAcceso.xhtml"
 EXCEL_NORMALIZADO = os.path.join("data", "credenciales-normalizado.xlsx")
 HEADLESS_BROWSER = False
-ESCRIBIR_EXCEL = False
+ESCRIBIR_EXCEL = True  # Ahora escribimos los cambios en el Excel
+
+# Mapeo de resultados a estados/detalles en Excel
+MAPEO_RESULTADOS = {
+    "CUENTA_ACTIVA": {
+        "estado": "Activo",
+        "detalle": "No se tienen acceso a las credenciales",
+    },
+    "NO_REGISTRADO": {
+        "estado": "No Activo",
+        "detalle": "No registrado en SUCAMEC",
+    },
+    "NO_COINCIDE": {
+        "estado": "No Activo",
+        "detalle": "Datos no coinciden con registro en SUCAMEC",
+    },
+    "PUEDE_REGISTRARSE": {
+        "estado": "No Activo",
+        "detalle": "Puede completar registro en SUCAMEC",
+    },
+}
 
 CANCEL_EVENT = threading.Event()
 
@@ -112,6 +132,15 @@ def formatear_duracion(segundos: float) -> str:
     m = (total % 3600) // 60
     s = total % 60
     return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def guardar_progreso_excel(df, idx_registro: int):
+    """Guarda progreso incremental para persistir cada registro procesado."""
+    try:
+        df.to_excel(EXCEL_NORMALIZADO, index=False)
+        print(f"   💾 Progreso guardado en Excel tras registro {idx_registro + 1}")
+    except Exception as e:
+        print(f"   ⚠️ No se pudo guardar progreso incremental: {e}")
 
 
 def esperar_fin_ajax(page, timeout_ms: int = 3000):
@@ -306,24 +335,24 @@ def obtener_texto_respuesta(page) -> str:
 
 
 def clasificar_texto_resultado(texto: str):
-    """Clasifica textos de respuesta (DOM o payload AJAX)."""
+    """Clasifica textos de respuesta (DOM o payload AJAX).
+    Retorna: (clasificacion_key, mensaje)
+    """
     t = str(texto or "").strip()
     if not t:
         return None, None
 
     tl = t.lower()
     if "ya existe una cuenta activa" in tl:
-        return True, t
-    if "ya existe un turno registrado" in tl:
-        return True, t
+        return "CUENTA_ACTIVA", t
     if "no coincide" in tl:
-        return False, t
+        return "NO_COINCIDE", t
     if "se ha validado los datos ingresados" in tl:
-        return False, f"Error/resultado: {t}"
+        return "PUEDE_REGISTRARSE", t
     if "error" in tl or "obligatorio" in tl or "requerido" in tl:
-        return False, f"Error/resultado: {t}"
+        return None, f"Error/resultado: {t}"
 
-    return False, f"Error/resultado: {t}"
+    return None, f"Sin clasificación: {t}"
 
 
 def es_payload_ajax_silencioso(payload_ajax: str) -> bool:
@@ -358,7 +387,6 @@ def clasificar_payload_ajax(payload_ajax: str):
 
     for frase in [
         "ya existe una cuenta activa",
-        "ya existe un turno registrado",
         "no coincide",
         "se ha validado los datos ingresados",
         "captcha",
@@ -616,14 +644,14 @@ def validar_resultado_inscripcion_por_ui(page, formulario_habilitado_antes: bool
 
             formulario_habilitado_despues = detectar_formulario_habilitado(page)
             if formulario_habilitado_despues:
-                return False, "No registrado en SUCAMEC (formulario habilitado)"
+                return "NO_REGISTRADO", "No registrado en SUCAMEC (formulario habilitado)"
 
             try:
                 contenido = page.content().lower()
-                if "ya existe una cuenta activa asociada a esta persona" in contenido:
-                    return True, "Cuenta activa - Credenciales invalidas"
-                if "se ha validado los datos ingresados" in contenido and "no coincide" in contenido:
-                    return False, "Datos no coinciden en validacion"
+                if "ya existe una cuenta activa" in contenido:
+                    return "CUENTA_ACTIVA", "Ya existe una cuenta activa"
+                if "no coincide" in contenido:
+                    return "NO_COINCIDE", "Los datos no coinciden"
             except Exception:
                 pass
 
@@ -640,15 +668,15 @@ def validar_resultado_inscripcion_por_ui(page, formulario_habilitado_antes: bool
 
         # Antes de clasificar como payload silencioso, priorizar señal de formulario habilitado.
         if detectar_formulario_habilitado(page):
-            return False, "No registrado en SUCAMEC (formulario habilitado)"
+            return "NO_REGISTRADO", "No registrado en SUCAMEC"
 
         if es_payload_ajax_silencioso(payload_ajax):
-            return False, "Datos no coinciden en validacion (sin mensaje del sistema)"
+            return "NO_COINCIDE", "Datos no coinciden con registro en SUCAMEC"
 
-        return None, None
+        return None, "Sin señal concluyente"
 
     except Exception as e:
-        return False, f"Error tecnico: {str(e)[:100]}"
+        return None, f"Error técnico: {str(e)[:100]}"
 
 
 def validar_acceso_inscripcion(page, dni: str, nombres: str, apellido_paterno: str, apellido_materno: str) -> tuple:
@@ -689,11 +717,11 @@ def validar_acceso_inscripcion(page, dni: str, nombres: str, apellido_paterno: s
         print("   Haciendo click en Validar...")
         click_ok, payload_ajax = click_validar_robusto(page)
         if not click_ok:
-            return False, "No se pudo accionar boton Validar"
+            return None, "No se pudo accionar boton Validar"
 
         esperar_fin_ajax(page)
 
-        existe_cuenta, mensaje = validar_resultado_inscripcion_por_ui(
+        clasificacion, mensaje = validar_resultado_inscripcion_por_ui(
             page,
             formulario_habilitado_antes,
             payload_ajax=payload_ajax,
@@ -702,7 +730,7 @@ def validar_acceso_inscripcion(page, dni: str, nombres: str, apellido_paterno: s
 
         # Reintento puntual cuando el sistema reporta perdida de tipo de documento.
         if (
-            existe_cuenta is False
+            clasificacion is None
             and mensaje
             and "tipo de documento" in mensaje.lower()
             and "obligatorio" in mensaje.lower()
@@ -713,21 +741,20 @@ def validar_acceso_inscripcion(page, dni: str, nombres: str, apellido_paterno: s
                 click_ok_retry, payload_ajax_retry = click_validar_robusto(page)
                 if click_ok_retry:
                     esperar_fin_ajax(page, timeout_ms=1800)
-                    existe_cuenta, mensaje = validar_resultado_inscripcion_por_ui(
+                    clasificacion, mensaje = validar_resultado_inscripcion_por_ui(
                         page,
                         formulario_habilitado_antes,
                         payload_ajax=payload_ajax_retry,
                         timeout_ms=3200,
                     )
 
-        if existe_cuenta is True:
-            return True, mensaje
-        if existe_cuenta is False:
-            return False, mensaje
+        if clasificacion:
+            print(f"   ✓ Resultado clasificado: {clasificacion}")
+            return clasificacion, mensaje
 
-        print("   Sin senal concluyente")
+        print("   ⚠️  Sin senal concluyente")
         log_diagnostico_post_validar(page)
-        return False, "Sin señal concluyente (sin mensaje ni activacion de formulario)"
+        return None, "Sin senal concluyente"
 
     except Exception as e:
         return False, f"Error tecnico: {str(e)[:120]}"
@@ -756,12 +783,21 @@ def procesar_validacion_acceso():
 
     print(f"Excel cargado: {len(df)} registros totales")
 
-    df_no_activos = df[df["estado"].astype(str).str.strip() == "No Activo"].copy()
+    # Filtrar solo No Activo + error de credenciales
+    df_no_activos = df[
+        (df["estado"].astype(str).str.strip() == "No Activo") &
+        (df["detalle_validacion"].astype(str).str.contains("Error de login: usuario o clave incorrectos", case=False, na=False))
+    ].copy()
     print(f"Registros No Activos encontrados: {len(df_no_activos)}")
-
-    if len(df_no_activos) == 0:
-        print("No hay registros No Activos para validar.")
+    
+    # Filtrados específicamente para esta validación
+    total_no_activos_especificos = len(df_no_activos)
+    if total_no_activos_especificos == 0:
+        print("No hay registros No Activo con 'Error de login: usuario o clave incorrectos' para validar.")
+        print("(Otros estados No Activo con diferentes detalles no serán procesados)")
         return
+    
+    print(f"   → Solo se procesarán registros con detalle 'Error de login: usuario o clave incorrectos'")
 
     disponibles_validar = df_no_activos.copy()
     total_no_activos = len(disponibles_validar)
@@ -832,18 +868,29 @@ def procesar_validacion_acceso():
 
                     page.wait_for_timeout(180)
 
-                    existe_cuenta, detalle_resultado = validar_acceso_inscripcion(
+                    clasificacion, detalle_resultado = validar_acceso_inscripcion(
                         page, dni, nombres, apellido_paterno, apellido_materno
                     )
 
-                    if existe_cuenta:
+                    # Aplicar mapeo de resultados
+                    if clasificacion in MAPEO_RESULTADOS:
+                        estado_nuevo = MAPEO_RESULTADOS[clasificacion]["estado"]
+                        detalle_nuevo = MAPEO_RESULTADOS[clasificacion]["detalle"]
+                        
                         if ESCRIBIR_EXCEL:
-                            df.at[idx, "estado"] = "Activo"
-                            df.at[idx, "detalle_validacion"] = detalle_resultado
-                        contador_activos_encontrados += 1
-                        print(f"   ACTIVO POTENCIAL: {detalle_resultado}")
+                            df.at[idx, "estado"] = estado_nuevo
+                            df.at[idx, "detalle_validacion"] = detalle_nuevo
+                            guardar_progreso_excel(df, idx)
+                        
+                        if clasificacion == "CUENTA_ACTIVA":
+                            contador_activos_encontrados += 1
+                            print(f"   ✅ ACTIVO POTENCIAL: {detalle_nuevo}")
+                        else:
+                            print(f"   ℹ️  {detalle_nuevo}")
                     else:
-                        print(f"   Sin cambios: {detalle_resultado}")
+                        print(f"   ⚠️  Sin clasificación válida: {detalle_resultado}")
+                        if ESCRIBIR_EXCEL:
+                            guardar_progreso_excel(df, idx)
 
                     contador_actualizados += 1
                     duracion_registro = time.perf_counter() - inicio_registro
@@ -878,15 +925,16 @@ def procesar_validacion_acceso():
                 pass
 
     if ESCRIBIR_EXCEL:
-        print("\nGuardando cambios en Excel...")
+        print("\n✅ Guardando cambios en Excel...")
         try:
             df.to_excel(EXCEL_NORMALIZADO, index=False)
-            print(f"Excel actualizado: {EXCEL_NORMALIZADO}")
+            print(f"✅ Excel actualizado correctamente: {EXCEL_NORMALIZADO}")
+            print(f"   Estados y detalles validación se han inscrito en el archivo")
         except Exception as e:
-            print(f"No se pudo guardar Excel: {e}")
+            print(f"❌ No se pudo guardar Excel: {e}")
             return
     else:
-        print("\nModo solo validacion: no se guardaron cambios en Excel")
+        print("\n⚠️  ESCRIBIR_EXCEL=False - cambios NO se guardaron en Excel")
 
     print("\n" + "=" * 70)
     print("  RESUMEN DE VALIDACION DE ACCESO")
