@@ -6,6 +6,8 @@ from datetime import datetime
 import threading
 import time
 import numpy as np
+import unicodedata
+import re
 
 # ====================== INTENTO DE IMPORTAR OCR (opcional) ======================
 OCR_AVAILABLE = False
@@ -30,6 +32,8 @@ load_dotenv()
 URL_LOGIN = "https://www.sucamec.gob.pe/sel/faces/login.xhtml?faces-redirect=true"
 EXCEL_DESNORMALIZADO = os.path.join("data", "credenciales-desnormalizado.xlsx")
 EXCEL_NORMALIZADO = os.path.join("data", "credenciales-normalizado.xlsx")
+GUARDAR_CADA_REGISTRO = True  # True: guarda progreso por cada iteración
+HEADLESS_BROWSER = False  # True acelera ejecución, pero desactiva CAPTCHA manual visual
 
 # Cancelacion global por consola (Enter)
 CANCEL_EVENT = threading.Event()
@@ -226,10 +230,7 @@ def normalizar_excel():
     
     # 2. Normalizar DNI (agregar 0 adelante si tiene 7 dígitos)
     if 'dni' in df_normalizado.columns:
-        df_normalizado['dni'] = df_normalizado['dni'].astype(str).str.strip()
-        df_normalizado['dni'] = df_normalizado['dni'].apply(
-            lambda x: '0' + x if len(x) == 7 and x.isdigit() else x
-        )
+        df_normalizado['dni'] = df_normalizado['dni'].apply(normalizar_dni)
         print("✅ DNI normalizado (completado con 0 si necesario)")
     
     # 3. Convertir apellidos y nombres a mayúsculas
@@ -259,24 +260,83 @@ def normalizar_excel():
     if os.path.exists(EXCEL_NORMALIZADO):
         try:
             df_existente = pd.read_excel(EXCEL_NORMALIZADO)
+            if 'dni' in df_existente.columns:
+                df_existente['dni'] = df_existente['dni'].apply(normalizar_dni)
             print(f"✅ Archivo normalizado existente encontrado con {len(df_existente)} registros")
         except Exception as e:
             print(f"⚠️  No se pudo leer archivo existente: {e}")
+
+    # 6. Asegurar columna ID estable para trazabilidad entre ejecuciones
+    if 'id' not in df_normalizado.columns:
+        df_normalizado.insert(0, 'id', '')
+
+    if df_existente is not None and 'id' in df_existente.columns and 'dni' in df_existente.columns and 'dni' in df_normalizado.columns:
+        mapa_id = (
+            df_existente[['dni', 'id']]
+            .dropna(subset=['dni'])
+            .drop_duplicates(subset=['dni'], keep='first')
+            .set_index('dni')['id']
+        )
+        if not mapa_id.empty:
+            df_normalizado['id'] = df_normalizado.apply(
+                lambda r: mapa_id.get(r['dni'], r['id']), axis=1
+            )
+
+    ids_ocupados = pd.to_numeric(df_normalizado['id'], errors='coerce').dropna().astype(int)
+    siguiente_id = int(ids_ocupados.max()) + 1 if len(ids_ocupados) > 0 else 1
+    for idx in df_normalizado.index:
+        if es_valor_vacio(df_normalizado.at[idx, 'id']):
+            df_normalizado.at[idx, 'id'] = siguiente_id
+            siguiente_id += 1
     
     # PRESERVACIÓN: Si existe archivo anterior, copiar estados/detalles válidos
     if df_existente is not None:
         print(f"\n🔄 PRESERVANDO datos existentes...")
         for idx, row in df_normalizado.iterrows():
-            dni_actual = str(row['dni']).strip()
+            dni_actual = normalizar_dni(row['dni'])
             # Buscar este DNI en el archivo existente
-            filas_existentes = df_existente[df_existente['dni'].astype(str).str.strip() == dni_actual]
+            filas_existentes = df_existente[df_existente['dni'] == dni_actual]
             if not filas_existentes.empty:
                 fila_existente = filas_existentes.iloc[0]
-                # Copiar estado y detalle si existen
-                if pd.notna(fila_existente.get('estado')) and str(fila_existente['estado']).strip():
-                    df_normalizado.at[idx, 'estado'] = str(fila_existente['estado']).strip()
-                    df_normalizado.at[idx, 'detalle_validacion'] = str(fila_existente.get('detalle_validacion', '')).strip()
-                    print(f"   ✓ DNI {dni_actual}: Estado preservado = {df_normalizado.at[idx, 'estado']}")
+                # Copiar estado y detalle/observación sin perder validaciones previas.
+                estado_prev = str(fila_existente.get('estado', '')).strip() if pd.notna(fila_existente.get('estado')) else ''
+                detalle_prev = str(fila_existente.get('detalle_validacion', '')).strip() if pd.notna(fila_existente.get('detalle_validacion')) else ''
+                observ_prev = str(fila_existente.get('observacion', '')).strip() if pd.notna(fila_existente.get('observacion')) else ''
+
+                if estado_prev:
+                    df_normalizado.at[idx, 'estado'] = estado_prev
+                detalle_final = detalle_prev or observ_prev
+                if detalle_final:
+                    df_normalizado.at[idx, 'detalle_validacion'] = detalle_final
+
+                if estado_prev or detalle_final:
+                    print(f"   ✓ DNI {dni_actual}: datos de validación preservados")
+
+        # Evita "pérdida" de filas si el desnormalizado trae menos DNIs que el histórico normalizado.
+        try:
+            dni_actuales = set(df_normalizado['dni'].apply(normalizar_dni))
+            df_existente_aux = df_existente.copy()
+            df_existente_aux['__dni_norm__'] = df_existente_aux['dni'].apply(normalizar_dni)
+            faltantes = df_existente_aux[~df_existente_aux['__dni_norm__'].isin(dni_actuales)].drop(columns=['__dni_norm__'])
+
+            if not faltantes.empty:
+                # Alinea columnas para concatenar sin perder estructura
+                for col in df_normalizado.columns:
+                    if col not in faltantes.columns:
+                        faltantes[col] = ''
+                for col in faltantes.columns:
+                    if col not in df_normalizado.columns:
+                        df_normalizado[col] = ''
+
+                faltantes = faltantes[df_normalizado.columns]
+                df_normalizado = pd.concat([df_normalizado, faltantes], ignore_index=True)
+                print(f"   ✓ Se conservaron {len(faltantes)} registros históricos no presentes en el desnormalizado actual")
+        except Exception as e:
+            print(f"⚠️  No se pudo conservar registros históricos faltantes: {e}")
+
+    if 'id' in df_normalizado.columns:
+        df_normalizado['id'] = pd.to_numeric(df_normalizado['id'], errors='coerce').fillna(0).astype(int)
+        df_normalizado = df_normalizado.sort_values(by='id', kind='stable').reset_index(drop=True)
     
     # Guardar Excel normalizado
     df_normalizado.to_excel(EXCEL_NORMALIZADO, index=False)
@@ -539,42 +599,113 @@ def obtener_motivo_no_activo(page) -> str:
     except Exception:
         return "No se pudo leer mensaje de error"
 
+
+def limpiar_texto_regla(texto: str) -> str:
+    """Normaliza texto para comparaciones robustas de reglas."""
+    t = str(texto or "").strip().lower()
+    t = unicodedata.normalize("NFKD", t)
+    t = "".join(c for c in t if not unicodedata.combining(c))
+    return " ".join(t.split())
+
+
+def es_valor_vacio(valor) -> bool:
+    """Detecta vacíos reales y placeholders comunes leídos desde Excel."""
+    if not pd.notna(valor):
+        return True
+    t = str(valor).strip().lower()
+    return t in {"", "nan", "none", "null", "nat"}
+
+
+def normalizar_dni(valor) -> str:
+    """Normaliza DNI para comparaciones confiables entre archivos Excel."""
+    if es_valor_vacio(valor):
+        return ""
+
+    texto = str(valor).strip()
+
+    # Si viene como número exportado por Excel (p.ej. "518206.0"),
+    # conservar la parte entera para no inventar dígitos.
+    if re.fullmatch(r"\d+(\.0+)?", texto):
+        solo_digitos = texto.split(".")[0]
+    else:
+        solo_digitos = re.sub(r"\D", "", texto)
+
+    if not solo_digitos:
+        return ""
+
+    # DNI peruano de 8 dígitos: completar con ceros a la izquierda cuando aplique.
+    if len(solo_digitos) <= 8:
+        solo_digitos = solo_digitos.zfill(8)
+
+    return solo_digitos
+
 def debe_reintentar_registro(dni: str, estado: str, detalle: str) -> bool:
     """
     Determina si un registro debe ser reintentado.
-    NO reintentar si:
-    - estado o detalle contiene "Número de Documento:*"
-    - detalle contiene "Error de login: usuario o clave incorrectos"
+    NO reintentar si el detalle marca error de acceso definitivo.
     """
-    if not estado or not detalle:
+    if es_valor_vacio(estado) or es_valor_vacio(detalle):
         return True  # Si está vacío, reintentar
-    
-    # NO reintentar estos casos
+
+    estado_norm = limpiar_texto_regla(estado)
+    detalle_norm = limpiar_texto_regla(detalle)
+
+    # NO reintentar estos casos (comparación tolerante a tildes/espacios/mayúsculas)
     no_reintentar = [
-        "Número de Documento:*",
-        "Error de login: usuario o clave incorrectos"
+        "error de login: usuario o clave incorrectos",
+        "usuario o clave incorrect",
+        "usuario o contrasena incorrect",
     ]
-    
+
     for patron in no_reintentar:
-        if patron in estado or patron in detalle:
+        if patron in estado_norm or patron in detalle_norm:
             return False
-    
+
     return True  # Reintentar por defecto
+
+
+def debe_procesar_registro(estado: str, detalle: str) -> bool:
+    """
+    Regla operativa de procesamiento:
+    - Procesar si estado está vacío.
+    - Procesar si estado es "No Activo" y el detalle NO es error de acceso definitivo.
+    - No procesar "Activo" ni otros estados cerrados.
+    """
+    estado_limpio = '' if es_valor_vacio(estado) else str(estado).strip()
+    detalle_limpio = str(detalle).strip() if pd.notna(detalle) else ''
+
+    if not estado_limpio:
+        return True
+
+    if estado_limpio == "No Activo":
+        return debe_reintentar_registro("", estado_limpio, detalle_limpio)
+
+    return False
 
 
 def obtener_prioridad_registro(estado: str, detalle: str) -> tuple:
     """
     Retorna (nivel_prioridad, descripcion) para ordenar registros.
-    Prioridad 1: CAPTCHA agotados
+    Prioridad 1: No Activo con Número de Documento/CAPTCHA
     Prioridad 2: Vacíos
-    Prioridad 3: No Activos
+    Prioridad 3: No Activos (otros)
     Prioridad 4: Activos
     """
-    if not estado or estado.strip() == '':
+    estado_norm = limpiar_texto_regla(estado)
+    detalle_norm = limpiar_texto_regla(detalle)
+
+    if estado_norm == "no activo" and (
+        "numero de documento" in detalle_norm
+        or "captcha" in detalle_norm
+        or "codigo de validacion" in detalle_norm
+    ):
+        return (1, "No Activo Prioritario")
+
+    if es_valor_vacio(estado):
         return (2, "Vacío")
     
     if "CAPTCHA incorrecto (reintentos agotados)" in estado or "CAPTCHA incorrecto (reintentos agotados)" in detalle:
-        return (1, "CAPTCHA Agotado")
+        return (1, "No Activo Prioritario")
     
     if estado == "No Activo":
         return (3, "No Activo")
@@ -583,6 +714,24 @@ def obtener_prioridad_registro(estado: str, detalle: str) -> tuple:
         return (4, "Activo")
     
     return (5, "Otro")
+
+
+def guardar_progreso_excel(df_normalizado, idx_registro: int):
+    """Persistencia incremental para no perder avance durante la ejecución."""
+    try:
+        df_normalizado.to_excel(EXCEL_NORMALIZADO, index=False)
+        print(f"   💾 Progreso guardado tras registro {idx_registro + 1}")
+    except Exception as e:
+        print(f"   ⚠️ No se pudo guardar progreso incremental: {e}")
+
+
+def formatear_duracion(segundos: float) -> str:
+    """Formatea una duración en HH:MM:SS."""
+    total = int(max(0, round(segundos)))
+    h = total // 3600
+    m = (total % 3600) // 60
+    s = total % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
 
 def generar_dashboard_validacion(df_normalizado):
@@ -725,7 +874,7 @@ DETALLES CRÍTICOS:
         print(f"⚠️  Error generando dashboard: {e}")
         return None
 
-def validar_credencial(dni: str, contrasena: str, max_reintentos_captcha: int = 3) -> tuple:
+def validar_credencial(dni: str, contrasena: str, max_reintentos_captcha: int = 3, playwright_instance=None) -> tuple:
     """
     Valida una credencial completa en SUCAMEC.
     Retorna (estado, detalle_validacion)
@@ -733,25 +882,22 @@ def validar_credencial(dni: str, contrasena: str, max_reintentos_captcha: int = 
     print(f"\n🔍 Validando credencial: DNI={dni}")
     
     browser = None
+    own_playwright = False
+    p = playwright_instance
     try:
         verificar_cancelacion()
-        with sync_playwright() as p:
-            for intento_login in range(1, max_reintentos_captcha + 1):
-                verificar_cancelacion()
-                print(f"🔁 Intento de login {intento_login}/{max_reintentos_captcha}")
+        if p is None:
+            p = sync_playwright().start()
+            own_playwright = True
 
-                # Igual que pipeline-armas: reiniciar navegador por intento de login.
-                if browser is not None:
-                    try:
-                        browser.close()
-                    except Exception:
-                        pass
-                    browser = None
+        browser = p.chromium.launch(headless=HEADLESS_BROWSER)
+        for intento_login in range(1, max_reintentos_captcha + 1):
+            verificar_cancelacion()
+            print(f"🔁 Intento de login {intento_login}/{max_reintentos_captcha}")
 
-                browser = p.chromium.launch(headless=False)
-                context = browser.new_context()
-                page = context.new_page()
-
+            context = browser.new_context()
+            page = context.new_page()
+            try:
                 print("📱 Navegando a SUCAMEC...")
                 page.goto(URL_LOGIN, wait_until="domcontentloaded", timeout=45000)
                 page.wait_for_timeout(800)
@@ -782,7 +928,7 @@ def validar_credencial(dni: str, contrasena: str, max_reintentos_captcha: int = 
                 if es_error_captcha(motivo) or captcha_incorrecto_en_pagina(page):
                     print(f"⚠️ CAPTCHA incorrecto detectado. ({motivo or 'sin mensaje'})")
                     if intento_login < max_reintentos_captcha:
-                        print("↻ Reintentando login en navegador nuevo...")
+                        print("↻ Reintentando login...")
                         continue
                     print("❌ Se agotaron los reintentos por CAPTCHA incorrecto")
                     return "No Activo", "CAPTCHA incorrecto (reintentos agotados)"
@@ -791,8 +937,13 @@ def validar_credencial(dni: str, contrasena: str, max_reintentos_captcha: int = 
                     motivo = f"No se detectó sesión autenticada (validado en {tiempo_espera:.2f}s)"
                 print(f"❌ Login fallido: {motivo}")
                 return "No Activo", motivo
+            finally:
+                try:
+                    context.close()
+                except Exception:
+                    pass
 
-            return "No Activo", "No se logró iniciar sesión"
+        return "No Activo", "No se logró iniciar sesión"
     except KeyboardInterrupt:
         print("🛑 Validación cancelada por usuario")
         return "No Activo", "Cancelado por usuario"
@@ -808,6 +959,11 @@ def validar_credencial(dni: str, contrasena: str, max_reintentos_captcha: int = 
             except Exception:
                 # Evita falsos negativos por cierre tardío del event loop de Playwright
                 pass
+        if own_playwright and p is not None:
+            try:
+                p.stop()
+            except Exception:
+                pass
 
 
 # ============================================================
@@ -819,11 +975,11 @@ def procesar_todas_credenciales():
     Lee el Excel normalizado e itera sobre todos los registros
     para validar cada credencial.
     
-    PRIORIDAD DE PROCESAMIENTO:
+    PRIORIDAD DE PROCESAMIENTO (dentro de los elegibles):
     1. CAPTCHA incorrecto (reintentos agotados)
     2. Registros con estado vacío
     3. Registros con "No Activo"
-    4. Registros con "Activo"
+    4. Registros con "Activo" (se muestran en prioridad, pero no se reprocesan)
     
     NO REINTENTA:
     - Número de Documento:*
@@ -833,6 +989,7 @@ def procesar_todas_credenciales():
     print("  VALIDADOR DE CREDENCIALES SUCAMEC")
     print("="*70)
     iniciar_listener_cancelacion()
+    inicio_flujo = time.perf_counter()
     
     # Normalizar Excel primero (preserva datos existentes)
     df_normalizado = normalizar_excel()
@@ -874,65 +1031,79 @@ def procesar_todas_credenciales():
     registros_inactivos = 0
     registros_saltados = 0
     contador_procesados = 0
-    total_a_procesar = len([p for p in prioridades if p[1] <= 3])
+    total_a_procesar = len([
+        p for p in prioridades
+        if debe_procesar_registro(
+            df_normalizado.loc[p[0], 'estado'],
+            df_normalizado.loc[p[0], 'detalle_validacion']
+        )
+    ])
     
-    for idx, nivel_prioridad, desc_prioridad in prioridades:
-        if cancelacion_solicitada():
-            print("🛑 Cancelación detectada. Se detiene el procesamiento.")
-            break
-        
-        try:
-            verificar_cancelacion()
-            row = df_normalizado.loc[idx]
-            dni = str(row['dni']).strip()
-            contrasena = str(row['contraseña']).strip()
-            estado_actual = str(row['estado']).strip() if pd.notna(row['estado']) else ''
-            detalle_actual = str(row['detalle_validacion']).strip() if pd.notna(row['detalle_validacion']) else ''
+    with sync_playwright() as p:
+        for idx, nivel_prioridad, desc_prioridad in prioridades:
+            if cancelacion_solicitada():
+                print("🛑 Cancelación detectada. Se detiene el procesamiento.")
+                break
             
-            # Validar que no estén vacíos
-            if not dni or not contrasena:
-                print(f"⚠️  Registro {idx+1}: DNI o contraseña vacíos")
-                df_normalizado.at[idx, 'estado'] = "No Activo"
-                df_normalizado.at[idx, 'detalle_validacion'] = "DNI o contraseña vacíos"
-                registros_inactivos += 1
-                continue
-            
-            # DECISIÓN: ¿Reintentar este registro?
-            if estado_actual and not debe_reintentar_registro(dni, estado_actual, detalle_actual):
-                print(f"⏭️  Registro {idx+1}: SALTADO (ya validado / no reintentar) - DNI={dni} - Estado: {estado_actual}")
-                registros_saltados += 1
-                if estado_actual == "Activo":
+            try:
+                verificar_cancelacion()
+                row = df_normalizado.loc[idx]
+                dni = str(row['dni']).strip()
+                contrasena = str(row['contraseña']).strip()
+                estado_actual = '' if es_valor_vacio(row['estado']) else str(row['estado']).strip()
+                detalle_actual = '' if es_valor_vacio(row['detalle_validacion']) else str(row['detalle_validacion']).strip()
+                
+                # Validar que no estén vacíos
+                if not dni or not contrasena:
+                    print(f"⚠️  Registro {idx+1}: DNI o contraseña vacíos")
+                    df_normalizado.at[idx, 'estado'] = "No Activo"
+                    df_normalizado.at[idx, 'detalle_validacion'] = "DNI o contraseña vacíos"
+                    registros_inactivos += 1
+                    if GUARDAR_CADA_REGISTRO:
+                        guardar_progreso_excel(df_normalizado, idx)
+                    continue
+                
+                # DECISIÓN: procesar solo vacíos o "No Activo" reintentable
+                if not debe_procesar_registro(estado_actual, detalle_actual):
+                    print(f"⏭️  Registro {idx+1}: SALTADO (no elegible para reproceso) - DNI={dni} - Estado: {estado_actual}")
+                    registros_saltados += 1
+                    if estado_actual == "Activo":
+                        registros_activos += 1
+                    else:
+                        registros_inactivos += 1
+                    continue
+                
+                # PROCESAR: Validar nuevamente
+                print(f"\n🔍 Procesando Prioridad {nivel_prioridad}: Registro {idx+1}")
+                contador_procesados += 1
+                print(f"   [{contador_procesados}/{total_a_procesar}] Validando DNI={dni}...")
+                
+                estado, detalle = validar_credencial(dni, contrasena, playwright_instance=p)
+                
+                # Registrar resultado
+                df_normalizado.at[idx, 'estado'] = estado
+                df_normalizado.at[idx, 'detalle_validacion'] = detalle
+                
+                if estado == "Activo":
                     registros_activos += 1
+                    print(f"   ✅ RESULTADO: {estado}")
                 else:
                     registros_inactivos += 1
-                continue
-            
-            # PROCESAR: Validar nuevamente
-            print(f"\n🔍 Procesando Prioridad {nivel_prioridad}: Registro {idx+1}")
-            contador_procesados += 1
-            print(f"   [{contador_procesados}/{total_a_procesar}] Validando DNI={dni}...")
-            
-            estado, detalle = validar_credencial(dni, contrasena)
-            
-            # Registrar resultado
-            df_normalizado.at[idx, 'estado'] = estado
-            df_normalizado.at[idx, 'detalle_validacion'] = detalle
-            
-            if estado == "Activo":
-                registros_activos += 1
-                print(f"   ✅ RESULTADO: {estado}")
-            else:
+                    print(f"   ❌ RESULTADO: {estado}")
+                    print(f"      Motivo: {detalle}")
+
+                if GUARDAR_CADA_REGISTRO:
+                    guardar_progreso_excel(df_normalizado, idx)
+                
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                print(f"❌ Error procesando registro {idx+1}: {e}")
+                df_normalizado.at[idx, 'estado'] = "No Activo"
+                df_normalizado.at[idx, 'detalle_validacion'] = f"Error en procesamiento: {str(e)[:100]}"
                 registros_inactivos += 1
-                print(f"   ❌ RESULTADO: {estado}")
-                print(f"      Motivo: {detalle}")
-            
-        except KeyboardInterrupt:
-            raise
-        except Exception as e:
-            print(f"❌ Error procesando registro {idx+1}: {e}")
-            df_normalizado.at[idx, 'estado'] = "No Activo"
-            df_normalizado.at[idx, 'detalle_validacion'] = f"Error en procesamiento: {str(e)[:100]}"
-            registros_inactivos += 1
+                if GUARDAR_CADA_REGISTRO:
+                    guardar_progreso_excel(df_normalizado, idx)
     
     # Guardar Excel con estados actualizados
     df_normalizado.to_excel(EXCEL_NORMALIZADO, index=False)
@@ -952,6 +1123,8 @@ def procesar_todas_credenciales():
     print(f"  ❌ No Activos: {registros_inactivos} ({100*registros_inactivos/total:.1f}%)")
     print(f"  ⏭️  Saltados (ya validados): {registros_saltados} ({100*registros_saltados/total:.1f}%)")
     print(f"  🔄 Procesados en esta ejecución: {contador_procesados}")
+    duracion_total = time.perf_counter() - inicio_flujo
+    print(f"  ⏱️  Tiempo total de flujo: {formatear_duracion(duracion_total)} ({duracion_total:.1f}s)")
     
     # Desglose por detalle
     print(f"\n📌 Detalles de No Activos (top 5):")

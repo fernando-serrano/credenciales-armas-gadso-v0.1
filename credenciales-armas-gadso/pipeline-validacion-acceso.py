@@ -1,0 +1,911 @@
+from dotenv import load_dotenv
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+import pandas as pd
+import os
+import threading
+import time
+import re
+
+load_dotenv()
+
+# ============================================================
+# CONFIGURACION
+# ============================================================
+
+URL_INSCRIPCION = "https://www.sucamec.gob.pe/sel/faces/pub/inscripcionAcceso.xhtml"
+EXCEL_NORMALIZADO = os.path.join("data", "credenciales-normalizado.xlsx")
+HEADLESS_BROWSER = False
+ESCRIBIR_EXCEL = False
+
+CANCEL_EVENT = threading.Event()
+
+
+def iniciar_listener_cancelacion():
+    """Inicia listener para cancelar con Enter."""
+    if CANCEL_EVENT.is_set():
+        return
+
+    def _esperar_enter_cancelacion():
+        try:
+            input("\nPresiona Enter para cancelar en cualquier momento...\n")
+            CANCEL_EVENT.set()
+            print("\nCancelacion solicitada.")
+        except Exception:
+            return
+
+    hilo = threading.Thread(target=_esperar_enter_cancelacion, daemon=True)
+    hilo.start()
+
+
+def cancelacion_solicitada() -> bool:
+    return CANCEL_EVENT.is_set()
+
+
+def verificar_cancelacion():
+    if cancelacion_solicitada():
+        raise KeyboardInterrupt("Cancelado por usuario")
+
+
+def es_error_pestana_cerrada(error: Exception) -> bool:
+    """Detecta errores cuando usuario cierra pestaña/contexto/browser."""
+    msg = str(error or "").lower()
+    patrones = [
+        "target page, context or browser has been closed",
+        "page closed",
+        "browser has been closed",
+        "context has been closed",
+    ]
+    return any(p in msg for p in patrones)
+
+
+# ============================================================
+# SELECTORES DE INSCRIPCION
+# ============================================================
+
+SEL_INSCRIPCION = {
+    # Selectores de tipo de documento
+    "tipo_doc_label": "#formInscAcceso\\:cbTipoDoc_label",
+    "tipo_doc_trigger": "#formInscAcceso\\:cbTipoDoc .ui-selectonemenu-trigger",
+    "tipo_doc_panel": "#formInscAcceso\\:cbTipoDoc_panel",
+    "tipo_doc_dni": "#formInscAcceso\\:cbTipoDoc_1",
+
+    # Campos de texto
+    "numero_doc": "#formInscAcceso\\:numDoc",
+    "nombres": "#formInscAcceso\\:nomb",
+    "apellido_paterno": "#formInscAcceso\\:appat",
+    "apellido_materno": "#formInscAcceso\\:apmat",
+
+    # Botones
+    "btn_validar": "#formInscAcceso\\:btnValidar",
+    "btn_salir": "button.btn-dark",
+
+    # Mensajes de respuesta
+    "msg_existe": ".ui-growl-message",
+    "msg_error": ".ui-messages-error, .ui-message-error, .ui-growl-message-error",
+
+    # Campos que se habilitan cuando la persona no tiene cuenta activa
+    "genero_label": "#formInscAcceso\\:cbGenero_label",
+    "genero_trigger": "#formInscAcceso\\:cbGenero .ui-selectonemenu-trigger",
+}
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def normalizar_texto(texto: str) -> str:
+    return re.sub(r"\s+", " ", str(texto or "").strip()).lower()
+
+
+def limpiar_dni(valor) -> str:
+    s = re.sub(r"\D", "", str(valor or ""))
+    return s[:8]
+
+
+def limpiar_texto(valor) -> str:
+    return re.sub(r"\s+", " ", str(valor or "").strip())
+
+
+def formatear_duracion(segundos: float) -> str:
+    total = int(max(0, round(segundos)))
+    h = total // 3600
+    m = (total % 3600) // 60
+    s = total % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def esperar_fin_ajax(page, timeout_ms: int = 3000):
+    """Espera a que no haya AJAX activo de jQuery/PrimeFaces si existe."""
+    inicio = time.time()
+    while (time.time() - inicio) * 1000 < timeout_ms:
+        if cancelacion_solicitada():
+            raise KeyboardInterrupt("Cancelado por usuario")
+        try:
+            ajax_activo = page.evaluate("""
+                () => {
+                    try {
+                        if (window.jQuery && typeof window.jQuery.active !== 'undefined') {
+                            return window.jQuery.active > 0;
+                        }
+                    } catch (e) {}
+                    return false;
+                }
+            """)
+            if not ajax_activo:
+                return
+        except Exception:
+            return
+        page.wait_for_timeout(120)
+
+
+def seleccionar_dni_tipo_doc(page) -> bool:
+    """Selecciona DNI en el combo de tipo de documento."""
+    try:
+        print("   Seleccionando tipo de documento: DNI")
+        trigger = page.locator(SEL_INSCRIPCION["tipo_doc_trigger"]).first
+        trigger.wait_for(state="visible", timeout=5000)
+        trigger.click()
+        panel = page.locator(SEL_INSCRIPCION["tipo_doc_panel"]).first
+        panel.wait_for(state="visible", timeout=5000)
+
+        opcion_dni = page.locator(SEL_INSCRIPCION["tipo_doc_dni"]).first
+        opcion_dni.wait_for(state="visible", timeout=5000)
+        opcion_dni.click()
+
+        esperar_fin_ajax(page, timeout_ms=2500)
+
+        label = page.locator(SEL_INSCRIPCION["tipo_doc_label"]).first
+        texto = (label.inner_text() or "").strip()
+        if "dni" in texto.lower():
+            print("   OK tipo documento: DNI")
+            return True
+
+        print(f"   Tipo documento no confirmado. Label actual: {texto}")
+        return False
+    except Exception as e:
+        print(f"   Error seleccionando tipo de documento: {e}")
+        return False
+
+
+def rellenar_campo(page, selector: str, valor: str, nombre: str) -> bool:
+    """Rellena un campo y valida que quede el valor correcto."""
+    try:
+        campo = page.locator(selector).first
+        campo.wait_for(state="visible", timeout=5000)
+
+        valor_esperado = limpiar_texto(valor)
+        for intento in range(1, 4):
+            campo.click()
+            page.wait_for_timeout(90)
+
+            # Ruta rapida: fill directo suele evitar perder el primer caracter.
+            try:
+                campo.fill(valor_esperado)
+                campo.dispatch_event("input")
+                campo.dispatch_event("change")
+                campo.dispatch_event("blur")
+                page.wait_for_timeout(180)
+                valor_real = (campo.input_value() or "").strip()
+                if valor_real == valor_esperado:
+                    print(f"   OK {nombre}: {valor_real}")
+                    return True
+            except Exception:
+                pass
+
+            # Fallback por tipeo para casos JSF que ignoran fill en primer intento.
+            campo.click()
+            page.wait_for_timeout(90)
+            try:
+                campo.press("Control+A")
+            except Exception:
+                pass
+            try:
+                campo.press("Backspace")
+            except Exception:
+                pass
+            try:
+                campo.fill("")
+            except Exception:
+                pass
+
+            page.wait_for_timeout(90)
+            delay = 30 if intento == 1 else 55
+            campo.type(valor_esperado, delay=delay)
+
+            try:
+                campo.dispatch_event("input")
+                campo.dispatch_event("change")
+                campo.dispatch_event("blur")
+            except Exception:
+                pass
+
+            page.wait_for_timeout(500)
+
+            valor_real = (campo.input_value() or "").strip()
+            if valor_real == valor_esperado:
+                print(f"   OK {nombre}: {valor_real}")
+                return True
+
+            print(
+                f"   Reintento {intento}/3 en {nombre}: esperado='{valor_esperado}' real='{valor_real}'"
+            )
+
+        print(f"   {nombre} no quedo correcto tras 3 intentos")
+        return False
+    except Exception as e:
+        print(f"   Error al rellenar {nombre}: {e}")
+        return False
+
+
+def asegurar_tipo_doc_dni(page) -> bool:
+    """Confirma que Tipo de documento siga en DNI; si no, lo selecciona otra vez."""
+    try:
+        label = page.locator(SEL_INSCRIPCION["tipo_doc_label"]).first
+        texto = (label.inner_text() or "").strip().lower()
+        if "dni" in texto:
+            return True
+    except Exception:
+        pass
+    return seleccionar_dni_tipo_doc(page)
+
+
+def detectar_formulario_habilitado(page) -> bool:
+    """Detecta si el formulario inferior se habilito tras validar."""
+    try:
+        # En PrimeFaces el estado real suele reflejarse en contenedor e input oculto.
+        contenedor = page.locator("#formInscAcceso\\:cbGenero").first
+        trigger = page.locator(SEL_INSCRIPCION["genero_trigger"]).first
+        input_hidden = page.locator("#formInscAcceso\\:cbGenero_input").first
+
+        if contenedor.count() == 0 and trigger.count() == 0:
+            return False
+
+        cls_cont = (contenedor.get_attribute("class") or "").lower() if contenedor.count() > 0 else ""
+        cls_trg = (trigger.get_attribute("class") or "").lower() if trigger.count() > 0 else ""
+        aria_trg = (trigger.get_attribute("aria-disabled") or "").lower() if trigger.count() > 0 else ""
+        dis_inp = (input_hidden.get_attribute("disabled") or "").lower() if input_hidden.count() > 0 else ""
+        aria_inp = (input_hidden.get_attribute("aria-disabled") or "").lower() if input_hidden.count() > 0 else ""
+
+        deshabilitado = (
+            ("ui-state-disabled" in cls_cont)
+            or ("ui-state-disabled" in cls_trg)
+            or (aria_trg == "true")
+            or (dis_inp == "disabled")
+            or (aria_inp == "true")
+        )
+        return not deshabilitado
+    except Exception:
+        return False
+
+
+def obtener_texto_respuesta(page) -> str:
+    """Obtiene texto visible de mensajes growl o de error."""
+    try:
+        growls = page.locator(SEL_INSCRIPCION["msg_existe"])
+        for i in range(growls.count()):
+            item = growls.nth(i)
+            if item.is_visible():
+                texto = (item.inner_text() or "").strip()
+                if texto:
+                    return texto
+    except Exception:
+        pass
+
+    try:
+        errs = page.locator(SEL_INSCRIPCION["msg_error"])
+        for i in range(errs.count()):
+            item = errs.nth(i)
+            if item.is_visible():
+                texto = (item.inner_text() or "").strip()
+                if texto:
+                    return texto
+    except Exception:
+        pass
+
+    return ""
+
+
+def clasificar_texto_resultado(texto: str):
+    """Clasifica textos de respuesta (DOM o payload AJAX)."""
+    t = str(texto or "").strip()
+    if not t:
+        return None, None
+
+    tl = t.lower()
+    if "ya existe una cuenta activa" in tl:
+        return True, t
+    if "ya existe un turno registrado" in tl:
+        return True, t
+    if "no coincide" in tl:
+        return False, t
+    if "se ha validado los datos ingresados" in tl:
+        return False, f"Error/resultado: {t}"
+    if "error" in tl or "obligatorio" in tl or "requerido" in tl:
+        return False, f"Error/resultado: {t}"
+
+    return False, f"Error/resultado: {t}"
+
+
+def es_payload_ajax_silencioso(payload_ajax: str) -> bool:
+    """Detecta respuesta AJAX sin mensajes visibles, típica de datos no coincidentes."""
+    payload = str(payload_ajax or "").strip()
+    if not payload:
+        return False
+
+    payload_lower = payload.lower()
+    if "ui-growl" in payload_lower:
+        return False
+    if "ya existe una cuenta activa" in payload_lower:
+        return False
+    if "no coincide" in payload_lower:
+        return False
+    if "cbgenero" in payload_lower:
+        return False
+
+    return True
+
+
+def clasificar_payload_ajax(payload_ajax: str):
+    """Clasifica respuesta AJAX solo si contiene senales de negocio reales."""
+    p = str(payload_ajax or "").strip()
+    if not p:
+        return None, None
+
+    pl = p.lower()
+
+    if "<partial-response" in pl and "msgs:[]" in pl:
+        return None, None
+
+    for frase in [
+        "ya existe una cuenta activa",
+        "ya existe un turno registrado",
+        "no coincide",
+        "se ha validado los datos ingresados",
+        "captcha",
+        "error",
+        "obligatorio",
+        "requerido",
+    ]:
+        if frase in pl:
+            return clasificar_texto_resultado(p)
+
+    return None, None
+
+
+def log_diagnostico_post_validar(page):
+    """Imprime un mini diagnóstico visual del estado post-validación."""
+    try:
+        print(f"   URL actual: {page.url}")
+    except Exception:
+        pass
+
+    try:
+        texto_msg = obtener_texto_respuesta(page)
+        if texto_msg:
+            print(f"   Mensaje visible: {texto_msg}")
+    except Exception:
+        pass
+
+    try:
+        print(f"   Formulario habilitado: {detectar_formulario_habilitado(page)}")
+    except Exception:
+        pass
+
+
+def click_validar_robusto(page) -> tuple:
+    """Acciona Validar de forma robusta.
+    Retorna: (accion_ok: bool, payload_ajax: str)
+    """
+    btn = page.locator(SEL_INSCRIPCION["btn_validar"]).first
+    btn.wait_for(state="visible", timeout=5000)
+    btn.scroll_into_view_if_needed()
+    form_habilitado_antes_click = detectar_formulario_habilitado(page)
+
+    habilitado = False
+    for _ in range(20):
+        aria = (btn.get_attribute("aria-disabled") or "").strip().lower()
+        dis = (btn.get_attribute("disabled") or "").strip().lower()
+        cls = (btn.get_attribute("class") or "").lower()
+
+        print(f"   Estado boton Validar -> aria-disabled={aria} disabled={dis} class={cls}")
+
+        if aria != "true" and dis != "disabled" and "ui-state-disabled" not in cls:
+            habilitado = True
+            break
+        page.wait_for_timeout(100)
+
+    if not habilitado:
+        print("   Boton Validar sigue deshabilitado (aria/disabled/class)")
+        return False, ""
+
+    try:
+        btn.hover()
+    except Exception:
+        pass
+
+    page.wait_for_timeout(150)
+
+    try:
+        btn.focus()
+    except Exception:
+        pass
+
+    page.wait_for_timeout(100)
+
+    def _hay_evidencia_accion(timeout_ms: int = 1400) -> bool:
+        inicio = time.time()
+        while (time.time() - inicio) * 1000 < timeout_ms:
+            if cancelacion_solicitada():
+                raise KeyboardInterrupt("Cancelado por usuario")
+            if obtener_texto_respuesta(page):
+                return True
+
+            if (not form_habilitado_antes_click) and detectar_formulario_habilitado(page):
+                return True
+
+            try:
+                contenido = page.content().lower()
+                if (
+                    "ya existe una cuenta activa" in contenido
+                    or "no coincide" in contenido
+                    or "captcha" in contenido
+                    or "turno registrado" in contenido
+                ):
+                    return True
+            except Exception:
+                pass
+
+            page.wait_for_timeout(120)
+        return False
+
+    def _extraer_post_data(request) -> str:
+        """Compatibilidad Playwright: post_data puede ser atributo o método."""
+        try:
+            post_data_attr = getattr(request, "post_data", None)
+            if callable(post_data_attr):
+                return post_data_attr() or ""
+            return post_data_attr or ""
+        except Exception:
+            return ""
+
+    def _es_post_btn_validar(resp) -> bool:
+        try:
+            if resp.request.method.upper() != "POST":
+                return False
+            if "inscripcionAcceso.xhtml" not in resp.url:
+                return False
+
+            post_data = _extraer_post_data(resp.request)
+            if not post_data:
+                # Fallback: aceptar POST de la misma pantalla para no perder payload.
+                return True
+
+            return "formInscAcceso:btnValidar" in post_data
+        except Exception:
+            return False
+
+    def _ejecutar_con_confirmacion(accion, nombre: str, usar_expect_response: bool = True):
+        post_detectado = False
+        payload_ajax = ""
+        print(f"   Intentando accion: {nombre}")
+        if not usar_expect_response:
+            try:
+                accion()
+            except Exception:
+                return False, ""
+            if _hay_evidencia_accion(timeout_ms=900):
+                print(f"   OK accion UI detectada tras {nombre}")
+                return True, ""
+            print(f"   Sin evidencia tras {nombre}")
+            return False, ""
+
+        try:
+            with page.expect_response(
+                _es_post_btn_validar,
+                timeout=1100,
+            ) as resp_info:
+                accion()
+            post_detectado = True
+            try:
+                payload_ajax = resp_info.value.text() or ""
+            except Exception:
+                payload_ajax = ""
+        except Exception:
+            # Evita re-click duplicado cuando la accion ya disparo evento sin respuesta capturada.
+            if _hay_evidencia_accion(timeout_ms=900):
+                print(f"   OK accion UI detectada tras {nombre}")
+                return True, payload_ajax
+            return False, payload_ajax
+
+        if post_detectado:
+            print(f"   OK POST real de btnValidar detectado tras {nombre}")
+            return True, payload_ajax
+
+        if _hay_evidencia_accion(timeout_ms=2200):
+            print(f"   OK accion UI detectada tras {nombre}")
+            return True, payload_ajax
+
+        print(f"   Sin evidencia tras {nombre}")
+        return False, payload_ajax
+
+    ok, payload = _ejecutar_con_confirmacion(
+        lambda: btn.click(timeout=2000),
+        "click Playwright",
+        usar_expect_response=False,
+    )
+    if ok:
+        return True, payload
+
+    ok, payload = _ejecutar_con_confirmacion(lambda: btn.click(force=True, timeout=2500), "click Playwright force")
+    if ok:
+        return True, payload
+
+    span_validar = page.locator("#formInscAcceso\\:btnValidar .ui-button-text").first
+    ok, payload = _ejecutar_con_confirmacion(lambda: span_validar.click(timeout=2200), "click span texto Validar")
+    if ok:
+        return True, payload
+
+    try:
+        ok, payload = _ejecutar_con_confirmacion(
+            lambda: page.evaluate("""
+                () => {
+                    const btn = document.getElementById('formInscAcceso:btnValidar');
+                    if (!btn) return false;
+                    btn.click();
+                    return true;
+                }
+            """),
+            "click JS"
+        )
+        if ok:
+            return True, payload
+    except Exception:
+        pass
+
+    return False, ""
+
+
+def validar_resultado_inscripcion_por_ui(page, formulario_habilitado_antes: bool, payload_ajax: str = "", timeout_ms: int = 3200):
+    """Evalua resultado por payload, mensajes, formulario y fallback HTML."""
+    try:
+        if payload_ajax:
+            clasif_payload = clasificar_payload_ajax(payload_ajax)
+            if clasif_payload != (None, None):
+                return clasif_payload
+
+        print("   Esperando senales de validacion (mensaje/formulario)...")
+        inicio_espera = time.perf_counter()
+        selectores_mensaje = [
+            SEL_INSCRIPCION["msg_existe"],
+            SEL_INSCRIPCION["msg_error"],
+            ".ui-messages-info",
+            ".ui-message-info",
+            ".ui-growl-message-info",
+        ]
+
+        # Fast-path: si el growl/error aparece rapido, clasificar sin esperar el loop completo.
+        try:
+            page.wait_for_selector(
+                f"{SEL_INSCRIPCION['msg_existe']}, {SEL_INSCRIPCION['msg_error']}",
+                state="visible",
+                timeout=900,
+            )
+            txt_rapido = obtener_texto_respuesta(page)
+            if txt_rapido:
+                return clasificar_texto_resultado(txt_rapido)
+        except Exception:
+            pass
+
+        while (time.perf_counter() - inicio_espera) * 1000 < timeout_ms:
+            if cancelacion_solicitada():
+                raise KeyboardInterrupt("Cancelado por usuario")
+            texto_msg = obtener_texto_respuesta(page)
+            if texto_msg:
+                return clasificar_texto_resultado(texto_msg)
+
+            for sel in selectores_mensaje:
+                try:
+                    loc = page.locator(sel)
+                    total = min(loc.count(), 3)
+                    for i in range(total):
+                        t = (loc.nth(i).inner_text() or "").strip()
+                        if t:
+                            return clasificar_texto_resultado(t)
+                except Exception:
+                    pass
+
+            formulario_habilitado_despues = detectar_formulario_habilitado(page)
+            if formulario_habilitado_despues:
+                return False, "No registrado en SUCAMEC (formulario habilitado)"
+
+            try:
+                contenido = page.content().lower()
+                if "ya existe una cuenta activa asociada a esta persona" in contenido:
+                    return True, "Cuenta activa - Credenciales invalidas"
+                if "se ha validado los datos ingresados" in contenido and "no coincide" in contenido:
+                    return False, "Datos no coinciden en validacion"
+            except Exception:
+                pass
+
+            page.wait_for_timeout(120)
+
+        page.wait_for_timeout(500)
+
+        if detectar_formulario_habilitado(page):
+            return False, "No registrado en SUCAMEC (formulario habilitado)"
+
+        txt_final = obtener_texto_respuesta(page)
+        if txt_final:
+            return clasificar_texto_resultado(txt_final)
+
+        # Antes de clasificar como payload silencioso, priorizar señal de formulario habilitado.
+        if detectar_formulario_habilitado(page):
+            return False, "No registrado en SUCAMEC (formulario habilitado)"
+
+        if es_payload_ajax_silencioso(payload_ajax):
+            return False, "Datos no coinciden en validacion (sin mensaje del sistema)"
+
+        return None, None
+
+    except Exception as e:
+        return False, f"Error tecnico: {str(e)[:100]}"
+
+
+def validar_acceso_inscripcion(page, dni: str, nombres: str, apellido_paterno: str, apellido_materno: str) -> tuple:
+    """Valida acceso por formulario de inscripcion. Retorna (existe_cuenta, mensaje)."""
+    try:
+        print(f"\nValidando acceso para: {dni}")
+
+        formulario_habilitado_antes = detectar_formulario_habilitado(page)
+
+        try:
+            page.evaluate(
+                """() => {
+                    document.querySelectorAll('.ui-growl-item-container, .ui-growl-message').forEach(el => el.remove());
+                }"""
+            )
+        except Exception:
+            pass
+
+        if not seleccionar_dni_tipo_doc(page):
+            return False, "No se pudo seleccionar tipo de documento"
+
+        if not rellenar_campo(page, SEL_INSCRIPCION["numero_doc"], dni, "Numero de documento"):
+            return False, "No se pudo ingresar numero de documento"
+        if not rellenar_campo(page, SEL_INSCRIPCION["nombres"], nombres, "Nombres"):
+            return False, "No se pudo ingresar nombres"
+        if not rellenar_campo(page, SEL_INSCRIPCION["apellido_paterno"], apellido_paterno, "Apellido paterno"):
+            return False, "No se pudo ingresar apellido paterno"
+        if not rellenar_campo(page, SEL_INSCRIPCION["apellido_materno"], apellido_materno, "Apellido materno"):
+            return False, "No se pudo ingresar apellido materno"
+
+        # En algunos casos PrimeFaces pierde seleccion del combo al editar campos.
+        if not asegurar_tipo_doc_dni(page):
+            return False, "No se pudo confirmar tipo de documento DNI"
+
+        esperar_fin_ajax(page, timeout_ms=3000)
+        page.wait_for_timeout(300)
+
+        print("   Haciendo click en Validar...")
+        click_ok, payload_ajax = click_validar_robusto(page)
+        if not click_ok:
+            return False, "No se pudo accionar boton Validar"
+
+        esperar_fin_ajax(page)
+
+        existe_cuenta, mensaje = validar_resultado_inscripcion_por_ui(
+            page,
+            formulario_habilitado_antes,
+            payload_ajax=payload_ajax,
+            timeout_ms=3200,
+        )
+
+        # Reintento puntual cuando el sistema reporta perdida de tipo de documento.
+        if (
+            existe_cuenta is False
+            and mensaje
+            and "tipo de documento" in mensaje.lower()
+            and "obligatorio" in mensaje.lower()
+        ):
+            print("   Reintentando validacion: se perdio Tipo de documento.")
+            if asegurar_tipo_doc_dni(page):
+                esperar_fin_ajax(page, timeout_ms=1200)
+                click_ok_retry, payload_ajax_retry = click_validar_robusto(page)
+                if click_ok_retry:
+                    esperar_fin_ajax(page, timeout_ms=1800)
+                    existe_cuenta, mensaje = validar_resultado_inscripcion_por_ui(
+                        page,
+                        formulario_habilitado_antes,
+                        payload_ajax=payload_ajax_retry,
+                        timeout_ms=3200,
+                    )
+
+        if existe_cuenta is True:
+            return True, mensaje
+        if existe_cuenta is False:
+            return False, mensaje
+
+        print("   Sin senal concluyente")
+        log_diagnostico_post_validar(page)
+        return False, "Sin señal concluyente (sin mensaje ni activacion de formulario)"
+
+    except Exception as e:
+        return False, f"Error tecnico: {str(e)[:120]}"
+
+
+# ============================================================
+# PROCESO PRINCIPAL
+# ============================================================
+
+def procesar_validacion_acceso():
+    """Procesa registros No Activo y valida acceso por pagina publica de inscripcion."""
+    print("\n" + "=" * 70)
+    print("  VALIDADOR DE ACCESO (INSCRIPCION/REGISTRO)")
+    print("=" * 70)
+    print(f"Modo navegador: {'VISIBLE' if not HEADLESS_BROWSER else 'HEADLESS'}")
+    inicio_flujo = time.perf_counter()
+
+    iniciar_listener_cancelacion()
+
+    print("\nLeyendo Excel normalizado...")
+    try:
+        df = pd.read_excel(EXCEL_NORMALIZADO)
+    except Exception as e:
+        print(f"No se pudo leer Excel: {e}")
+        return
+
+    print(f"Excel cargado: {len(df)} registros totales")
+
+    df_no_activos = df[df["estado"].astype(str).str.strip() == "No Activo"].copy()
+    print(f"Registros No Activos encontrados: {len(df_no_activos)}")
+
+    if len(df_no_activos) == 0:
+        print("No hay registros No Activos para validar.")
+        return
+
+    disponibles_validar = df_no_activos.copy()
+    total_no_activos = len(disponibles_validar)
+
+    if "id" in disponibles_validar.columns:
+        disponibles_validar = disponibles_validar.drop_duplicates(subset=["id"], keep="first")
+    else:
+        subset_cols = [
+            c for c in ["dni", "nombres", "apelido paterno", "apellido materno"]
+            if c in disponibles_validar.columns
+        ]
+        if subset_cols:
+            disponibles_validar = disponibles_validar.drop_duplicates(subset=subset_cols, keep="first")
+
+    if len(disponibles_validar) != total_no_activos:
+        print(f"Duplicados detectados: {total_no_activos - len(disponibles_validar)}")
+
+    print(f"Candidatos para validar acceso: {len(disponibles_validar)}")
+    if not ESCRIBIR_EXCEL:
+        print("Modo solo validacion activo: no se escribira en el Excel")
+
+    if len(disponibles_validar) == 0:
+        print("No hay registros No Activos para procesar.")
+        return
+
+    contador_actualizados = 0
+    contador_activos_encontrados = 0
+    pestana_cerrada = False
+    flujo_cancelado = False
+    motivo_cancelacion = ""
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=HEADLESS_BROWSER)
+        context = browser.new_context()
+        page = context.new_page()
+
+        try:
+            for contador, (idx, row) in enumerate(disponibles_validar.iterrows(), 1):
+                if cancelacion_solicitada():
+                    flujo_cancelado = True
+                    motivo_cancelacion = "Cancelado por usuario (Enter)"
+                    print("Cancelacion detectada.")
+                    break
+
+                try:
+                    inicio_registro = time.perf_counter()
+                    verificar_cancelacion()
+
+                    id_registro = row["id"] if "id" in row else idx
+                    dni = limpiar_dni(row.get("dni", ""))
+                    nombres = limpiar_texto(row.get("nombres", ""))
+                    apellido_paterno = limpiar_texto(
+                        row.get("apellido paterno", row.get("apelido paterno", ""))
+                    )
+                    apellido_materno = limpiar_texto(row.get("apellido materno", ""))
+
+                    print(f"\n[{contador}/{len(disponibles_validar)}] ID={id_registro} | DNI={dni} | {apellido_paterno}, {nombres}")
+
+                    if len(dni) != 8:
+                        print("   DNI invalido, se omite.")
+                        continue
+
+                    try:
+                        page.goto(URL_INSCRIPCION, wait_until="domcontentloaded", timeout=30000)
+                    except PlaywrightTimeoutError:
+                        print("Timeout al cargar pagina. Reintentando...")
+                        page.reload(wait_until="domcontentloaded")
+
+                    page.wait_for_timeout(180)
+
+                    existe_cuenta, detalle_resultado = validar_acceso_inscripcion(
+                        page, dni, nombres, apellido_paterno, apellido_materno
+                    )
+
+                    if existe_cuenta:
+                        if ESCRIBIR_EXCEL:
+                            df.at[idx, "estado"] = "Activo"
+                            df.at[idx, "detalle_validacion"] = detalle_resultado
+                        contador_activos_encontrados += 1
+                        print(f"   ACTIVO POTENCIAL: {detalle_resultado}")
+                    else:
+                        print(f"   Sin cambios: {detalle_resultado}")
+
+                    contador_actualizados += 1
+                    duracion_registro = time.perf_counter() - inicio_registro
+                    duracion_total = time.perf_counter() - inicio_flujo
+                    print(
+                        f"   Avance: procesados={contador_actualizados}/{len(disponibles_validar)} | "
+                        f"activos={contador_activos_encontrados} | "
+                        f"t_registro={formatear_duracion(duracion_registro)} | "
+                        f"t_total={formatear_duracion(duracion_total)}"
+                    )
+
+                except KeyboardInterrupt:
+                    flujo_cancelado = True
+                    motivo_cancelacion = "Cancelado por usuario (Enter/Ctrl+C)"
+                    print("Cancelacion detectada durante el registro. Deteniendo flujo...")
+                    break
+                except Exception as e:
+                    if es_error_pestana_cerrada(e):
+                        pestana_cerrada = True
+                        print("Se cerro la pestaña durante la validacion. Flujo detenido.")
+                        break
+                    print(f"Error en registro ID={id_registro} DNI={dni}: {e}")
+
+        finally:
+            try:
+                context.close()
+            except Exception:
+                pass
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+    if ESCRIBIR_EXCEL:
+        print("\nGuardando cambios en Excel...")
+        try:
+            df.to_excel(EXCEL_NORMALIZADO, index=False)
+            print(f"Excel actualizado: {EXCEL_NORMALIZADO}")
+        except Exception as e:
+            print(f"No se pudo guardar Excel: {e}")
+            return
+    else:
+        print("\nModo solo validacion: no se guardaron cambios en Excel")
+
+    print("\n" + "=" * 70)
+    print("  RESUMEN DE VALIDACION DE ACCESO")
+    print("=" * 70)
+    print(f"Registros No Activos totales: {len(df_no_activos)}")
+    print(f"Candidatos para validar: {len(disponibles_validar)}")
+    print(f"Procesados exitosamente: {contador_actualizados}")
+    print(f"Cuentas activas encontradas: {contador_activos_encontrados}")
+    if flujo_cancelado:
+        print(f"Estado final: {motivo_cancelacion}")
+    if pestana_cerrada:
+        print("Estado final: Se cerro la pestaña (manejo controlado).")
+    if not flujo_cancelado and not pestana_cerrada:
+        print("Estado final: Flujo completado.")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    try:
+        procesar_validacion_acceso()
+    except KeyboardInterrupt:
+        print("\nFlujo cancelado por usuario (Ctrl+C).")
