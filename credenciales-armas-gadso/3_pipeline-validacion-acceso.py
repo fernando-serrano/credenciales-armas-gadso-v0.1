@@ -14,6 +14,7 @@ load_dotenv()
 
 URL_INSCRIPCION = "https://www.sucamec.gob.pe/sel/faces/pub/inscripcionAcceso.xhtml"
 EXCEL_NORMALIZADO = os.path.join("data", "credenciales-normalizado.xlsx")
+DASHBOARD_VALIDACION_ACCESO = os.path.join("data", "dashboard_validacion_acceso.png")
 HEADLESS_BROWSER = False
 ESCRIBIR_EXCEL = True  # Ahora escribimos los cambios en el Excel
 
@@ -34,6 +35,10 @@ MAPEO_RESULTADOS = {
     "PUEDE_REGISTRARSE": {
         "estado": "No Activo",
         "detalle": "Puede completar registro en SUCAMEC",
+    },
+    "PENDIENTE_ACTIVACION": {
+        "estado": "No Activo",
+        "detalle": "Cuenta pendiente de activación (revisar correo)",
     },
 }
 
@@ -141,6 +146,135 @@ def guardar_progreso_excel(df, idx_registro: int):
         print(f"   💾 Progreso guardado en Excel tras registro {idx_registro + 1}")
     except Exception as e:
         print(f"   ⚠️ No se pudo guardar progreso incremental: {e}")
+
+
+def generar_dashboard_validacion_acceso_desde_excel(ruta_excel: str = EXCEL_NORMALIZADO):
+    """Genera dashboard leyendo directamente el Excel normalizado guardado en disco."""
+    try:
+        import matplotlib.pyplot as plt
+
+        if not os.path.exists(ruta_excel):
+            print(f"⚠️ No existe el Excel para dashboard: {ruta_excel}")
+            return None
+
+        df_excel = pd.read_excel(ruta_excel)
+        if len(df_excel) == 0:
+            print("⚠️ El Excel está vacío; no se puede generar dashboard")
+            return None
+
+        if "estado" not in df_excel.columns:
+            df_excel["estado"] = ""
+        if "detalle_validacion" not in df_excel.columns:
+            df_excel["detalle_validacion"] = ""
+
+        # Vista global del Excel
+        conteo_estado = (
+            df_excel["estado"]
+            .fillna("SIN_ESTADO")
+            .astype(str)
+            .str.strip()
+            .replace("", "SIN_ESTADO")
+            .value_counts()
+        )
+        conteo_detalle = (
+            df_excel["detalle_validacion"]
+            .fillna("SIN_DETALLE")
+            .astype(str)
+            .str.strip()
+            .replace("", "SIN_DETALLE")
+            .value_counts()
+            .head(8)
+        )
+
+        # Vista del subconjunto objetivo del pipeline 3
+        filtro_objetivo = (
+            (df_excel["estado"].astype(str).str.strip() == "No Activo")
+            & (
+                df_excel["detalle_validacion"]
+                .astype(str)
+                .str.contains("Error de login: usuario o clave incorrectos", case=False, na=False)
+            )
+        )
+        df_objetivo = df_excel[filtro_objetivo].copy()
+        conteo_objetivo = (
+            df_objetivo["detalle_validacion"]
+            .fillna("SIN_DETALLE")
+            .astype(str)
+            .str.strip()
+            .replace("", "SIN_DETALLE")
+            .value_counts()
+            .head(8)
+        )
+
+        fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+        fig.suptitle("Dashboard - Validación de Acceso (Inscripción)", fontsize=15, fontweight="bold")
+
+        # Estado global del Excel
+        colores_estado = ["#2ca02c" if k == "Activo" else "#d62728" if k == "No Activo" else "#7f7f7f" for k in conteo_estado.index]
+        axes[0, 0].bar(conteo_estado.index, conteo_estado.values, color=colores_estado)
+        axes[0, 0].set_title("Estado global en Excel")
+        axes[0, 0].set_ylabel("Cantidad")
+        axes[0, 0].tick_params(axis="x", rotation=25)
+        for i, v in enumerate(conteo_estado.values):
+            axes[0, 0].text(i, v, str(v), ha="center", va="bottom", fontsize=9)
+
+        # Pie de estado global
+        axes[0, 1].pie(
+            conteo_estado.values,
+            labels=conteo_estado.index,
+            autopct="%1.1f%%",
+            startangle=90,
+            textprops={"fontsize": 10},
+        )
+        axes[0, 1].set_title("Estado final escrito en Excel")
+
+        # Top detalle_validacion global
+        etiquetas_detalle = [d if len(d) <= 45 else d[:42] + "..." for d in conteo_detalle.index]
+        axes[1, 0].barh(range(len(conteo_detalle)), conteo_detalle.values, color="#4c78a8")
+        axes[1, 0].set_yticks(range(len(conteo_detalle)))
+        axes[1, 0].set_yticklabels(etiquetas_detalle, fontsize=9)
+        axes[1, 0].invert_yaxis()
+        axes[1, 0].set_title("Top detalle_validacion (global Excel)")
+        axes[1, 0].set_xlabel("Cantidad")
+        for i, v in enumerate(conteo_detalle.values):
+            axes[1, 0].text(v, i, f" {v}", va="center", fontsize=9)
+
+        # Resumen numérico desde Excel
+        axes[1, 1].axis("off")
+        activos = int((df_excel["estado"].astype(str).str.strip() == "Activo").sum())
+        no_activos = int((df_excel["estado"].astype(str).str.strip() == "No Activo").sum())
+        sin_estado = int((df_excel["estado"].fillna("").astype(str).str.strip() == "").sum())
+        objetivo_restante = len(df_objetivo)
+        top_objetivo = "-"
+        if len(conteo_objetivo) > 0:
+            top_objetivo = f"{conteo_objetivo.index[0]} ({int(conteo_objetivo.iloc[0])})"
+        resumen = (
+            f"Total filas en Excel: {len(df_excel)}\n"
+            f"Activos: {activos}\n"
+            f"No Activos: {no_activos}\n"
+            f"Sin estado: {sin_estado}\n"
+            f"Pendientes objetivo P3: {objetivo_restante}\n"
+            f"Top detalle objetivo: {top_objetivo}\n"
+            f"Imagen: {DASHBOARD_VALIDACION_ACCESO}"
+        )
+        axes[1, 1].text(
+            0.02,
+            0.98,
+            resumen,
+            va="top",
+            fontsize=10,
+            family="monospace",
+            bbox={"boxstyle": "round", "facecolor": "#f7f7f7", "alpha": 0.8},
+        )
+
+        plt.tight_layout(rect=[0, 0.02, 1, 0.95])
+        fig.savefig(DASHBOARD_VALIDACION_ACCESO, dpi=150)
+        plt.close(fig)
+        print(f"✅ Dashboard guardado en: {DASHBOARD_VALIDACION_ACCESO}")
+        return DASHBOARD_VALIDACION_ACCESO
+    except Exception as e:
+        print(f"⚠️ Error generando dashboard de validación de acceso: {e}")
+        return None
 
 
 def esperar_fin_ajax(page, timeout_ms: int = 3000):
@@ -345,6 +479,8 @@ def clasificar_texto_resultado(texto: str):
     tl = t.lower()
     if "ya existe una cuenta activa" in tl:
         return "CUENTA_ACTIVA", t
+    if "cuenta pendiente de activación" in tl or "cuenta pendiente de activacion" in tl:
+        return "PENDIENTE_ACTIVACION", t
     if "no coincide" in tl:
         return "NO_COINCIDE", t
     if "se ha validado los datos ingresados" in tl:
@@ -387,6 +523,8 @@ def clasificar_payload_ajax(payload_ajax: str):
 
     for frase in [
         "ya existe una cuenta activa",
+        "cuenta pendiente de activación",
+        "cuenta pendiente de activacion",
         "no coincide",
         "se ha validado los datos ingresados",
         "captcha",
@@ -650,6 +788,8 @@ def validar_resultado_inscripcion_por_ui(page, formulario_habilitado_antes: bool
                 contenido = page.content().lower()
                 if "ya existe una cuenta activa" in contenido:
                     return "CUENTA_ACTIVA", "Ya existe una cuenta activa"
+                if "cuenta pendiente de activación" in contenido or "cuenta pendiente de activacion" in contenido:
+                    return "PENDIENTE_ACTIVACION", "Cuenta pendiente de activación"
                 if "no coincide" in contenido:
                     return "NO_COINCIDE", "Los datos no coinciden"
             except Exception:
@@ -660,7 +800,7 @@ def validar_resultado_inscripcion_por_ui(page, formulario_habilitado_antes: bool
         page.wait_for_timeout(500)
 
         if detectar_formulario_habilitado(page):
-            return False, "No registrado en SUCAMEC (formulario habilitado)"
+            return "NO_REGISTRADO", "No registrado en SUCAMEC (formulario habilitado)"
 
         txt_final = obtener_texto_respuesta(page)
         if txt_final:
@@ -887,6 +1027,7 @@ def procesar_validacion_acceso():
                             print(f"   ✅ ACTIVO POTENCIAL: {detalle_nuevo}")
                         else:
                             print(f"   ℹ️  {detalle_nuevo}")
+
                     else:
                         print(f"   ⚠️  Sin clasificación válida: {detalle_resultado}")
                         if ESCRIBIR_EXCEL:
@@ -935,6 +1076,9 @@ def procesar_validacion_acceso():
             return
     else:
         print("\n⚠️  ESCRIBIR_EXCEL=False - cambios NO se guardaron en Excel")
+
+    print("\n📊 Generando dashboard de validación de acceso...")
+    generar_dashboard_validacion_acceso_desde_excel(EXCEL_NORMALIZADO)
 
     print("\n" + "=" * 70)
     print("  RESUMEN DE VALIDACION DE ACCESO")
