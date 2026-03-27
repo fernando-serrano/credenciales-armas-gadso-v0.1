@@ -9,6 +9,92 @@ import numpy as np
 import unicodedata
 import re
 
+
+def quitar_tildes(texto: str) -> str:
+    t = str(texto or "")
+    t = unicodedata.normalize("NFKD", t)
+    return "".join(c for c in t if not unicodedata.combining(c))
+
+
+def normalizar_nombre(texto: str) -> str:
+    t = quitar_tildes(texto)
+    t = re.sub(r"\s+", " ", t).strip().upper()
+    return t
+
+
+def limpiar_tildes_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Quita tildes en todas las columnas de texto antes de guardar en Excel."""
+    for col in df.columns:
+        if df[col].dtype == "object":
+            df[col] = df[col].apply(lambda v: quitar_tildes(v) if pd.notna(v) else v)
+    return df
+
+
+def columna_documento(df: pd.DataFrame) -> str:
+    if "nro_documento" in df.columns:
+        return "nro_documento"
+    if "dni" in df.columns:
+        return "dni"
+    return "nro_documento"
+
+
+def tipo_doc_por_nro(nro_documento: str) -> str:
+    n = len(str(nro_documento or ""))
+    if n == 8:
+        return "DNI"
+    if n == 9:
+        return "CARNET EXTRANJERIA"
+    return ""
+
+
+def deduplicar_por_fecha_cercana(df: pd.DataFrame, col_doc: str = "nro_documento", col_fecha_ref: str = "__fecha_ref") -> pd.DataFrame:
+    """Para documentos repetidos, conserva la fila con fecha mas cercana a hoy."""
+    if col_doc not in df.columns or col_fecha_ref not in df.columns:
+        return df
+
+    df_aux = df.copy()
+    doc_norm = df_aux[col_doc].fillna("").astype(str).str.strip()
+
+    sin_doc = df_aux[doc_norm == ""].copy()
+    con_doc = df_aux[doc_norm != ""].copy()
+    if con_doc.empty:
+        return df
+
+    hoy = pd.Timestamp.today().normalize()
+    con_doc[col_fecha_ref] = pd.to_datetime(con_doc[col_fecha_ref], errors="coerce")
+    con_doc["__sin_fecha"] = con_doc[col_fecha_ref].isna().astype(int)
+    con_doc["__dist_dias"] = (con_doc[col_fecha_ref] - hoy).abs().dt.days.fillna(10**9)
+
+    con_doc = con_doc.sort_values(
+        by=[col_doc, "__sin_fecha", "__dist_dias", col_fecha_ref],
+        ascending=[True, True, True, False],
+        kind="stable",
+    )
+    con_doc = con_doc.drop_duplicates(subset=[col_doc], keep="first")
+    con_doc = con_doc.drop(columns=["__sin_fecha", "__dist_dias"], errors="ignore")
+
+    return pd.concat([con_doc, sin_doc], ignore_index=True)
+
+
+def ordenar_por_fecha_asc(df: pd.DataFrame, col_fecha: str = "fecha") -> pd.DataFrame:
+    """Ordena por fecha de la mas lejana a la mas reciente (ascendente)."""
+    if col_fecha not in df.columns:
+        return df
+    df_aux = df.copy()
+    fecha_dt = pd.to_datetime(df_aux[col_fecha], format="%d/%m/%y", errors="coerce")
+    df_aux["__sin_fecha"] = fecha_dt.isna().astype(int)
+    df_aux["__fecha_sort"] = fecha_dt
+
+    sort_cols = ["__sin_fecha", "__fecha_sort"]
+    sort_asc = [True, True]
+    if "id" in df_aux.columns:
+        df_aux["__id_sort"] = pd.to_numeric(df_aux["id"], errors="coerce").fillna(10**9)
+        sort_cols.append("__id_sort")
+        sort_asc.append(True)
+
+    df_aux = df_aux.sort_values(by=sort_cols, ascending=sort_asc, kind="stable").reset_index(drop=True)
+    return df_aux.drop(columns=["__sin_fecha", "__fecha_sort", "__id_sort"], errors="ignore")
+
 # ====================== INTENTO DE IMPORTAR OCR (opcional) ======================
 OCR_AVAILABLE = False
 try:
@@ -205,39 +291,71 @@ def solve_captcha_ocr(page, contexto: str = "CAPTCHA", max_intentos: int = 6):
 def normalizar_excel():
     """
     Normaliza el Excel desnormalizado:
-    - Separa "marca temporal" en fecha y hora
-    - Completa DNI con 0 si tiene 7 dígitos
+    - Estandariza nro_documento
+    - Calcula tipo_doc por longitud (8 DNI, 9 CARNET EXTRANJERIA)
+    - Formatea fecha en dd/mm/aa
+    - Elimina marca temporal y hora
     - Convierte apellidos y nombre a mayúsculas
     - Unifica nombre completo
     """
     print("🔄 Leyendo Excel desnormalizado...")
-    df = pd.read_excel(EXCEL_DESNORMALIZADO)
+    df = pd.read_excel(EXCEL_DESNORMALIZADO, dtype=str)
     
     # Hacer copia para no afectar original
     df_normalizado = df.copy()
     
     print(f"📋 Columnas encontradas: {df_normalizado.columns.tolist()}")
     
-    # 1. Separar "marca temporal" en fecha y hora
-    if 'marca temporal' in df_normalizado.columns:
-        try:
-            df_normalizado['marca temporal'] = pd.to_datetime(df_normalizado['marca temporal'], errors='coerce')
-            df_normalizado['fecha'] = df_normalizado['marca temporal'].dt.date
-            df_normalizado['hora'] = df_normalizado['marca temporal'].dt.strftime('%H:%M:%S')
-            print("✅ Marca temporal separada en fecha y hora")
-        except Exception as e:
-            print(f"⚠️  Error al separar marca temporal: {e}")
+    # 1. Estandarizar columna nro_documento
+    if "nro_documento" not in df_normalizado.columns:
+        if "nro_doc" in df_normalizado.columns:
+            df_normalizado["nro_documento"] = df_normalizado["nro_doc"]
+        elif "dni" in df_normalizado.columns:
+            df_normalizado["nro_documento"] = df_normalizado["dni"]
+
+    columnas_alias_doc = [c for c in ["nro_doc", "dni"] if c in df_normalizado.columns]
+    if columnas_alias_doc:
+        df_normalizado = df_normalizado.drop(columns=columnas_alias_doc)
+
+    # 2. Normalizar nro_documento y tipo_doc (preservar tipo_doc ya informado)
+    if "nro_documento" in df_normalizado.columns:
+        df_normalizado["nro_documento"] = df_normalizado["nro_documento"].apply(normalizar_dni)
+        if "tipo_doc" not in df_normalizado.columns:
+            df_normalizado["tipo_doc"] = ""
+        tipo_actual = df_normalizado["tipo_doc"].fillna("").astype(str).str.strip()
+        tipo_calculado = df_normalizado["nro_documento"].apply(tipo_doc_por_nro)
+        df_normalizado["tipo_doc"] = tipo_actual.where(tipo_actual != "", tipo_calculado)
+        print("✅ nro_documento normalizado y tipo_doc calculado")
+
+    # 3. Formatear fecha y eliminar hora/marca temporal
+    if "fecha" in df_normalizado.columns:
+        fecha_dt = pd.to_datetime(df_normalizado["fecha"], errors="coerce")
+    elif "marca temporal" in df_normalizado.columns:
+        fecha_dt = pd.to_datetime(df_normalizado["marca temporal"], errors="coerce")
+    else:
+        fecha_dt = pd.Series([pd.NaT] * len(df_normalizado), index=df_normalizado.index)
+
+    df_normalizado["__fecha_ref"] = fecha_dt
+    df_normalizado["fecha"] = fecha_dt.dt.strftime("%d/%m/%y")
+    for col in ["hora", "marca temporal"]:
+        if col in df_normalizado.columns:
+            df_normalizado = df_normalizado.drop(columns=[col])
+
+    # Si hay documentos repetidos, conservar el mas cercano a hoy por fecha.
+    total_antes = len(df_normalizado)
+    df_normalizado = deduplicar_por_fecha_cercana(df_normalizado)
+    total_despues = len(df_normalizado)
+    if total_despues < total_antes:
+        print(f"✅ Duplicados por documento depurados: {total_antes - total_despues} (criterio: fecha mas cercana a hoy)")
+
+    if "__fecha_ref" in df_normalizado.columns:
+        df_normalizado = df_normalizado.drop(columns=["__fecha_ref"])
     
-    # 2. Normalizar DNI (agregar 0 adelante si tiene 7 dígitos)
-    if 'dni' in df_normalizado.columns:
-        df_normalizado['dni'] = df_normalizado['dni'].apply(normalizar_dni)
-        print("✅ DNI normalizado (completado con 0 si necesario)")
-    
-    # 3. Convertir apellidos y nombres a mayúsculas
+    # 4. Convertir apellidos y nombres a mayúsculas (sin tildes)
     nombre_cols = ['apelido paterno', 'apellido materno', 'nombres']
     for col in nombre_cols:
         if col in df_normalizado.columns:
-            df_normalizado[col] = df_normalizado[col].astype(str).str.strip().str.upper()
+            df_normalizado[col] = df_normalizado[col].apply(normalizar_nombre)
     
     # 4. Crear columna de nombre completo unificado
     if all(col in df_normalizado.columns for col in nombre_cols):
@@ -259,9 +377,14 @@ def normalizar_excel():
     df_existente = None
     if os.path.exists(EXCEL_NORMALIZADO):
         try:
-            df_existente = pd.read_excel(EXCEL_NORMALIZADO)
-            if 'dni' in df_existente.columns:
-                df_existente['dni'] = df_existente['dni'].apply(normalizar_dni)
+            df_existente = pd.read_excel(EXCEL_NORMALIZADO, dtype=str)
+            if "nro_documento" not in df_existente.columns:
+                if "nro_doc" in df_existente.columns:
+                    df_existente["nro_documento"] = df_existente["nro_doc"]
+                elif "dni" in df_existente.columns:
+                    df_existente["nro_documento"] = df_existente["dni"]
+            if "nro_documento" in df_existente.columns:
+                df_existente["nro_documento"] = df_existente["nro_documento"].apply(normalizar_dni)
             print(f"✅ Archivo normalizado existente encontrado con {len(df_existente)} registros")
         except Exception as e:
             print(f"⚠️  No se pudo leer archivo existente: {e}")
@@ -270,16 +393,16 @@ def normalizar_excel():
     if 'id' not in df_normalizado.columns:
         df_normalizado.insert(0, 'id', '')
 
-    if df_existente is not None and 'id' in df_existente.columns and 'dni' in df_existente.columns and 'dni' in df_normalizado.columns:
+    if df_existente is not None and 'id' in df_existente.columns and 'nro_documento' in df_existente.columns and 'nro_documento' in df_normalizado.columns:
         mapa_id = (
-            df_existente[['dni', 'id']]
-            .dropna(subset=['dni'])
-            .drop_duplicates(subset=['dni'], keep='first')
-            .set_index('dni')['id']
+            df_existente[['nro_documento', 'id']]
+            .dropna(subset=['nro_documento'])
+            .drop_duplicates(subset=['nro_documento'], keep='first')
+            .set_index('nro_documento')['id']
         )
         if not mapa_id.empty:
             df_normalizado['id'] = df_normalizado.apply(
-                lambda r: mapa_id.get(r['dni'], r['id']), axis=1
+                lambda r: mapa_id.get(r['nro_documento'], r['id']), axis=1
             )
 
     ids_ocupados = pd.to_numeric(df_normalizado['id'], errors='coerce').dropna().astype(int)
@@ -289,35 +412,48 @@ def normalizar_excel():
             df_normalizado.at[idx, 'id'] = siguiente_id
             siguiente_id += 1
     
-    # PRESERVACIÓN: Si existe archivo anterior, copiar estados/detalles válidos
+    # PRESERVACIÓN: Si existe archivo anterior, copiar estado/detalle/tipo_doc válidos
     if df_existente is not None:
         print(f"\n🔄 PRESERVANDO datos existentes...")
+        mapa_id = None
+        if 'id' in df_existente.columns:
+            mapa_id = df_existente.drop_duplicates(subset=['id'], keep='first').set_index('id')
+
         for idx, row in df_normalizado.iterrows():
-            dni_actual = normalizar_dni(row['dni'])
-            # Buscar este DNI en el archivo existente
-            filas_existentes = df_existente[df_existente['dni'] == dni_actual]
+            nro_doc_actual = normalizar_dni(row.get('nro_documento', ''))
+            # Buscar este nro_documento en el archivo existente
+            filas_existentes = df_existente[df_existente['nro_documento'] == nro_doc_actual]
             if not filas_existentes.empty:
                 fila_existente = filas_existentes.iloc[0]
-                # Copiar estado y detalle/observación sin perder validaciones previas.
+                # Copiar estado y detalle/tipo_doc sin perder validaciones previas.
                 estado_prev = str(fila_existente.get('estado', '')).strip() if pd.notna(fila_existente.get('estado')) else ''
                 detalle_prev = str(fila_existente.get('detalle_validacion', '')).strip() if pd.notna(fila_existente.get('detalle_validacion')) else ''
-                observ_prev = str(fila_existente.get('observacion', '')).strip() if pd.notna(fila_existente.get('observacion')) else ''
+                tipo_prev = str(fila_existente.get('tipo_doc', '')).strip() if pd.notna(fila_existente.get('tipo_doc')) else ''
+
+                id_actual = row.get('id', '')
+                if mapa_id is not None and str(id_actual) in mapa_id.index.astype(str):
+                    fila_id = mapa_id.loc[mapa_id.index.astype(str) == str(id_actual)].iloc[0]
+                    estado_prev = str(fila_id.get('estado', '') or '').strip() or estado_prev
+                    detalle_prev = str(fila_id.get('detalle_validacion', '') or '').strip() or detalle_prev
+                    tipo_prev = str(fila_id.get('tipo_doc', '') or '').strip() or tipo_prev
 
                 if estado_prev:
                     df_normalizado.at[idx, 'estado'] = estado_prev
-                detalle_final = detalle_prev or observ_prev
+                detalle_final = detalle_prev
                 if detalle_final:
                     df_normalizado.at[idx, 'detalle_validacion'] = detalle_final
+                if tipo_prev and es_valor_vacio(df_normalizado.at[idx, 'tipo_doc']):
+                    df_normalizado.at[idx, 'tipo_doc'] = tipo_prev
 
-                if estado_prev or detalle_final:
-                    print(f"   ✓ DNI {dni_actual}: datos de validación preservados")
+                if estado_prev or detalle_final or tipo_prev:
+                    print(f"   ✓ Documento {nro_doc_actual}: datos de validación preservados")
 
         # Evita "pérdida" de filas si el desnormalizado trae menos DNIs que el histórico normalizado.
         try:
-            dni_actuales = set(df_normalizado['dni'].apply(normalizar_dni))
+            docs_actuales = set(df_normalizado['nro_documento'].apply(normalizar_dni))
             df_existente_aux = df_existente.copy()
-            df_existente_aux['__dni_norm__'] = df_existente_aux['dni'].apply(normalizar_dni)
-            faltantes = df_existente_aux[~df_existente_aux['__dni_norm__'].isin(dni_actuales)].drop(columns=['__dni_norm__'])
+            df_existente_aux['__doc_norm__'] = df_existente_aux['nro_documento'].apply(normalizar_dni)
+            faltantes = df_existente_aux[~df_existente_aux['__doc_norm__'].isin(docs_actuales)].drop(columns=['__doc_norm__'])
 
             if not faltantes.empty:
                 # Alinea columnas para concatenar sin perder estructura
@@ -336,9 +472,11 @@ def normalizar_excel():
 
     if 'id' in df_normalizado.columns:
         df_normalizado['id'] = pd.to_numeric(df_normalizado['id'], errors='coerce').fillna(0).astype(int)
-        df_normalizado = df_normalizado.sort_values(by='id', kind='stable').reset_index(drop=True)
+
+    df_normalizado = ordenar_por_fecha_asc(df_normalizado)
     
-    # Guardar Excel normalizado
+    # Guardar Excel normalizado sin tildes en columnas de texto
+    df_normalizado = limpiar_tildes_dataframe(df_normalizado)
     df_normalizado.to_excel(EXCEL_NORMALIZADO, index=False)
     print(f"\n✅ Excel normalizado guardado en {EXCEL_NORMALIZADO}")
     print(f"📊 Registros totales: {len(df_normalizado)}\n")
@@ -380,20 +518,22 @@ def seleccionar_en_selectonemenu(page, trigger_selector: str, panel_selector: st
     print(f"   ✓ {nombre_campo} seleccionado: {texto_label}")
 
 
-def ingresar_credenciales_y_captcha(page, dni: str, contrasena: str) -> bool:
+def ingresar_credenciales_y_captcha(page, nro_documento: str, contrasena: str, tipo_doc: str = "DNI") -> bool:
     """
     Ingresa credenciales y resuelve CAPTCHA
     """
     try:
         verificar_cancelacion()
-        # 1. Seleccionar tipo de documento DNI
+        # 1. Seleccionar tipo de documento segun tipo_doc
         print(f"📝 Seleccionando tipo de documento...")
+        tipo_doc_norm = str(tipo_doc or "DNI").strip().upper()
+        valor_tipo_doc = "CARNET" if "CARNET" in tipo_doc_norm else "DNI - Documento Nacional de Identidad"
         seleccionar_en_selectonemenu(
             page,
             trigger_selector=SEL["tipo_doc_trigger"],
             panel_selector=SEL["tipo_doc_panel"],
             label_selector=SEL["tipo_doc_label"],
-            valor="DNI - Documento Nacional de Identidad",
+            valor=valor_tipo_doc,
             nombre_campo="Tipo de Documento"
         )
         
@@ -402,7 +542,7 @@ def ingresar_credenciales_y_captcha(page, dni: str, contrasena: str) -> bool:
         print(f"📝 Ingresando número de documento...")
         campo_numero = page.locator(SEL["numero_documento"])
         campo_numero.wait_for(state="visible", timeout=5000)
-        campo_numero.fill(dni)
+        campo_numero.fill(nro_documento)
         page.wait_for_timeout(300)
         
         # 3. Usuario (también es el DNI)
@@ -410,7 +550,7 @@ def ingresar_credenciales_y_captcha(page, dni: str, contrasena: str) -> bool:
         print(f"📝 Ingresando usuario...")
         campo_usuario = page.locator(SEL["usuario"])
         campo_usuario.wait_for(state="visible", timeout=5000)
-        campo_usuario.fill(dni)
+        campo_usuario.fill(nro_documento)
         page.wait_for_timeout(300)
         
         # 4. Contraseña
@@ -421,7 +561,7 @@ def ingresar_credenciales_y_captcha(page, dni: str, contrasena: str) -> bool:
         campo_clave.fill(contrasena)
         page.wait_for_timeout(300)
         
-        print(f"✅ Credenciales ingresadas para DNI: {dni}")
+        print(f"✅ Credenciales ingresadas para DOC: {nro_documento}")
         
         # 5. Resolver CAPTCHA
         verificar_cancelacion()
@@ -617,7 +757,7 @@ def es_valor_vacio(valor) -> bool:
 
 
 def normalizar_dni(valor) -> str:
-    """Normaliza DNI para comparaciones confiables entre archivos Excel."""
+    """Normaliza nro_documento preservando ceros a la izquierda cuando aplique."""
     if es_valor_vacio(valor):
         return ""
 
@@ -633,7 +773,7 @@ def normalizar_dni(valor) -> str:
     if not solo_digitos:
         return ""
 
-    # DNI peruano de 8 dígitos: completar con ceros a la izquierda cuando aplique.
+    # Para 8 dígitos (DNI) completar con ceros a la izquierda; para 9 (CE) conservar longitud.
     if len(solo_digitos) <= 8:
         solo_digitos = solo_digitos.zfill(8)
 
@@ -719,6 +859,7 @@ def obtener_prioridad_registro(estado: str, detalle: str) -> tuple:
 def guardar_progreso_excel(df_normalizado, idx_registro: int):
     """Persistencia incremental para no perder avance durante la ejecución."""
     try:
+        df_normalizado = limpiar_tildes_dataframe(df_normalizado)
         df_normalizado.to_excel(EXCEL_NORMALIZADO, index=False)
         print(f"   💾 Progreso guardado tras registro {idx_registro + 1}")
     except Exception as e:
@@ -874,12 +1015,12 @@ DETALLES CRÍTICOS:
         print(f"⚠️  Error generando dashboard: {e}")
         return None
 
-def validar_credencial(dni: str, contrasena: str, max_reintentos_captcha: int = 3, playwright_instance=None) -> tuple:
+def validar_credencial(nro_documento: str, contrasena: str, tipo_doc: str = "DNI", max_reintentos_captcha: int = 3, playwright_instance=None) -> tuple:
     """
     Valida una credencial completa en SUCAMEC.
     Retorna (estado, detalle_validacion)
     """
-    print(f"\n🔍 Validando credencial: DNI={dni}")
+    print(f"\n🔍 Validando credencial: DOC={nro_documento} ({tipo_doc})")
     
     browser = None
     own_playwright = False
@@ -911,7 +1052,7 @@ def validar_credencial(dni: str, contrasena: str, max_reintentos_captcha: int = 
                 except Exception as e:
                     print(f"ℹ️  Tab Tradicional: {e}")
 
-                if not ingresar_credenciales_y_captcha(page, dni, contrasena):
+                if not ingresar_credenciales_y_captcha(page, nro_documento, contrasena, tipo_doc=tipo_doc):
                     return "No Activo", "No se pudo completar ingreso de datos/CAPTCHA"
 
                 print("🔍 Validando inicio de sesión...")
@@ -995,7 +1136,7 @@ def procesar_todas_credenciales():
     df_normalizado = normalizar_excel()
     
     # Validar que existan las columnas necesarias
-    required_cols = ['dni', 'contraseña']
+    required_cols = ['nro_documento', 'contraseña']
     for col in required_cols:
         if col not in df_normalizado.columns:
             print(f"❌ ERROR: Columna '{col}' no encontrada en Excel")
@@ -1048,16 +1189,16 @@ def procesar_todas_credenciales():
             try:
                 verificar_cancelacion()
                 row = df_normalizado.loc[idx]
-                dni = str(row['dni']).strip()
+                nro_documento = normalizar_dni(row.get('nro_documento', row.get('nro_doc', row.get('dni', ''))))
                 contrasena = str(row['contraseña']).strip()
                 estado_actual = '' if es_valor_vacio(row['estado']) else str(row['estado']).strip()
                 detalle_actual = '' if es_valor_vacio(row['detalle_validacion']) else str(row['detalle_validacion']).strip()
                 
                 # Validar que no estén vacíos
-                if not dni or not contrasena:
-                    print(f"⚠️  Registro {idx+1}: DNI o contraseña vacíos")
+                if not nro_documento or not contrasena:
+                    print(f"⚠️  Registro {idx+1}: nro_documento o contraseña vacíos")
                     df_normalizado.at[idx, 'estado'] = "No Activo"
-                    df_normalizado.at[idx, 'detalle_validacion'] = "DNI o contraseña vacíos"
+                    df_normalizado.at[idx, 'detalle_validacion'] = "nro_documento o contraseña vacíos"
                     registros_inactivos += 1
                     if GUARDAR_CADA_REGISTRO:
                         guardar_progreso_excel(df_normalizado, idx)
@@ -1065,7 +1206,7 @@ def procesar_todas_credenciales():
                 
                 # DECISIÓN: procesar solo vacíos o "No Activo" reintentable
                 if not debe_procesar_registro(estado_actual, detalle_actual):
-                    print(f"⏭️  Registro {idx+1}: SALTADO (no elegible para reproceso) - DNI={dni} - Estado: {estado_actual}")
+                    print(f"⏭️  Registro {idx+1}: SALTADO (no elegible para reproceso) - DOC={nro_documento} - Estado: {estado_actual}")
                     registros_saltados += 1
                     if estado_actual == "Activo":
                         registros_activos += 1
@@ -1076,9 +1217,10 @@ def procesar_todas_credenciales():
                 # PROCESAR: Validar nuevamente
                 print(f"\n🔍 Procesando Prioridad {nivel_prioridad}: Registro {idx+1}")
                 contador_procesados += 1
-                print(f"   [{contador_procesados}/{total_a_procesar}] Validando DNI={dni}...")
+                print(f"   [{contador_procesados}/{total_a_procesar}] Validando DOC={nro_documento}...")
                 
-                estado, detalle = validar_credencial(dni, contrasena, playwright_instance=p)
+                tipo_doc = str(row.get('tipo_doc', tipo_doc_por_nro(nro_documento))).strip().upper()
+                estado, detalle = validar_credencial(nro_documento, contrasena, tipo_doc=tipo_doc, playwright_instance=p)
                 
                 # Registrar resultado
                 df_normalizado.at[idx, 'estado'] = estado

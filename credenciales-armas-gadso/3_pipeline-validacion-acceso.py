@@ -5,6 +5,7 @@ import os
 import threading
 import time
 import re
+import unicodedata
 
 load_dotenv()
 
@@ -124,11 +125,35 @@ def normalizar_texto(texto: str) -> str:
 
 def limpiar_dni(valor) -> str:
     s = re.sub(r"\D", "", str(valor or ""))
-    return s[:8]
+    if len(s) <= 8:
+        return s.zfill(8)
+    return s[:9]
 
 
 def limpiar_texto(valor) -> str:
     return re.sub(r"\s+", " ", str(valor or "").strip())
+
+
+def normalizar_id(valor, fallback: str = "") -> str:
+    """Normaliza id para evitar nulos y formatos numericos como 12.0."""
+    s = str(valor or "").strip()
+    if re.fullmatch(r"\d+\.0+", s):
+        s = s.split(".")[0]
+    return s or str(fallback or "")
+
+
+def quitar_tildes(texto: str) -> str:
+    t = str(texto or "")
+    t = unicodedata.normalize("NFKD", t)
+    return "".join(c for c in t if not unicodedata.combining(c))
+
+
+def limpiar_tildes_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Quita tildes de todas las columnas de texto antes de guardar en Excel."""
+    for col in df.columns:
+        if df[col].dtype == "object":
+            df[col] = df[col].apply(lambda v: quitar_tildes(v) if pd.notna(v) else v)
+    return df
 
 
 def formatear_duracion(segundos: float) -> str:
@@ -142,6 +167,7 @@ def formatear_duracion(segundos: float) -> str:
 def guardar_progreso_excel(df, idx_registro: int):
     """Guarda progreso incremental para persistir cada registro procesado."""
     try:
+        df = limpiar_tildes_dataframe(df)
         df.to_excel(EXCEL_NORMALIZADO, index=False)
         print(f"   💾 Progreso guardado en Excel tras registro {idx_registro + 1}")
     except Exception as e:
@@ -302,25 +328,42 @@ def esperar_fin_ajax(page, timeout_ms: int = 3000):
 
 
 def seleccionar_dni_tipo_doc(page) -> bool:
-    """Selecciona DNI en el combo de tipo de documento."""
+    """Compatibilidad: selecciona DNI."""
+    return seleccionar_tipo_doc(page, "DNI")
+
+
+def seleccionar_tipo_doc(page, tipo_doc: str = "DNI") -> bool:
+    """Selecciona tipo de documento (DNI o CARNET EXTRANJERIA) en el combo."""
     try:
-        print("   Seleccionando tipo de documento: DNI")
+        tipo_doc_norm = str(tipo_doc or "DNI").strip().upper()
+        print(f"   Seleccionando tipo de documento: {tipo_doc_norm}")
         trigger = page.locator(SEL_INSCRIPCION["tipo_doc_trigger"]).first
         trigger.wait_for(state="visible", timeout=5000)
         trigger.click()
         panel = page.locator(SEL_INSCRIPCION["tipo_doc_panel"]).first
         panel.wait_for(state="visible", timeout=5000)
 
-        opcion_dni = page.locator(SEL_INSCRIPCION["tipo_doc_dni"]).first
-        opcion_dni.wait_for(state="visible", timeout=5000)
-        opcion_dni.click()
+        if "CARNET" in tipo_doc_norm:
+            opcion_ce = panel.locator("li.ui-selectonemenu-item").filter(has_text="CARNET")
+            opcion_ce.first.wait_for(state="visible", timeout=5000)
+            opcion_ce.first.click()
+        else:
+            opcion_dni = page.locator(SEL_INSCRIPCION["tipo_doc_dni"]).first
+            opcion_dni.wait_for(state="visible", timeout=5000)
+            opcion_dni.click()
 
         esperar_fin_ajax(page, timeout_ms=2500)
 
         label = page.locator(SEL_INSCRIPCION["tipo_doc_label"]).first
         texto = (label.inner_text() or "").strip()
-        if "dni" in texto.lower():
-            print("   OK tipo documento: DNI")
+        texto_lower = texto.lower()
+        if "CARNET" in tipo_doc_norm:
+            ok = ("carnet" in texto_lower) or ("extranjer" in texto_lower)
+        else:
+            ok = "dni" in texto_lower
+
+        if ok:
+            print(f"   OK tipo documento: {texto}")
             return True
 
         print(f"   Tipo documento no confirmado. Label actual: {texto}")
@@ -400,16 +443,17 @@ def rellenar_campo(page, selector: str, valor: str, nombre: str) -> bool:
         return False
 
 
-def asegurar_tipo_doc_dni(page) -> bool:
-    """Confirma que Tipo de documento siga en DNI; si no, lo selecciona otra vez."""
+def asegurar_tipo_doc_dni(page, tipo_doc: str = "DNI") -> bool:
+    """Confirma que Tipo de documento se mantenga; si no, lo re-selecciona."""
     try:
         label = page.locator(SEL_INSCRIPCION["tipo_doc_label"]).first
         texto = (label.inner_text() or "").strip().lower()
-        if "dni" in texto:
+        tipo_doc_norm = str(tipo_doc or "DNI").strip().upper()
+        if ("CARNET" in tipo_doc_norm and ("carnet" in texto or "extranjer" in texto)) or ("CARNET" not in tipo_doc_norm and "dni" in texto):
             return True
     except Exception:
         pass
-    return seleccionar_dni_tipo_doc(page)
+    return seleccionar_tipo_doc(page, tipo_doc=tipo_doc)
 
 
 def detectar_formulario_habilitado(page) -> bool:
@@ -819,7 +863,7 @@ def validar_resultado_inscripcion_por_ui(page, formulario_habilitado_antes: bool
         return None, f"Error técnico: {str(e)[:100]}"
 
 
-def validar_acceso_inscripcion(page, dni: str, nombres: str, apellido_paterno: str, apellido_materno: str) -> tuple:
+def validar_acceso_inscripcion(page, dni: str, nombres: str, apellido_paterno: str, apellido_materno: str, tipo_doc: str = "DNI") -> tuple:
     """Valida acceso por formulario de inscripcion. Retorna (existe_cuenta, mensaje)."""
     try:
         print(f"\nValidando acceso para: {dni}")
@@ -835,7 +879,7 @@ def validar_acceso_inscripcion(page, dni: str, nombres: str, apellido_paterno: s
         except Exception:
             pass
 
-        if not seleccionar_dni_tipo_doc(page):
+        if not seleccionar_tipo_doc(page, tipo_doc=tipo_doc):
             return False, "No se pudo seleccionar tipo de documento"
 
         if not rellenar_campo(page, SEL_INSCRIPCION["numero_doc"], dni, "Numero de documento"):
@@ -848,7 +892,7 @@ def validar_acceso_inscripcion(page, dni: str, nombres: str, apellido_paterno: s
             return False, "No se pudo ingresar apellido materno"
 
         # En algunos casos PrimeFaces pierde seleccion del combo al editar campos.
-        if not asegurar_tipo_doc_dni(page):
+        if not asegurar_tipo_doc_dni(page, tipo_doc=tipo_doc):
             return False, "No se pudo confirmar tipo de documento DNI"
 
         esperar_fin_ajax(page, timeout_ms=3000)
@@ -876,7 +920,7 @@ def validar_acceso_inscripcion(page, dni: str, nombres: str, apellido_paterno: s
             and "obligatorio" in mensaje.lower()
         ):
             print("   Reintentando validacion: se perdio Tipo de documento.")
-            if asegurar_tipo_doc_dni(page):
+            if asegurar_tipo_doc_dni(page, tipo_doc=tipo_doc):
                 esperar_fin_ajax(page, timeout_ms=1200)
                 click_ok_retry, payload_ajax_retry = click_validar_robusto(page)
                 if click_ok_retry:
@@ -916,10 +960,16 @@ def procesar_validacion_acceso():
 
     print("\nLeyendo Excel normalizado...")
     try:
-        df = pd.read_excel(EXCEL_NORMALIZADO)
+        df = pd.read_excel(EXCEL_NORMALIZADO, dtype=str)
     except Exception as e:
         print(f"No se pudo leer Excel: {e}")
         return
+
+    if "id" not in df.columns:
+        print("⚠️ El Excel no tiene columna 'id'. Se generara de forma secuencial para este flujo.")
+        df.insert(0, "id", [str(i) for i in range(1, len(df) + 1)])
+
+    df["id"] = [normalizar_id(v, fallback=i) for i, v in enumerate(df["id"], start=1)]
 
     print(f"Excel cargado: {len(df)} registros totales")
 
@@ -986,18 +1036,18 @@ def procesar_validacion_acceso():
                     inicio_registro = time.perf_counter()
                     verificar_cancelacion()
 
-                    id_registro = row["id"] if "id" in row else idx
-                    dni = limpiar_dni(row.get("dni", ""))
+                    id_registro = normalizar_id(row.get("id", ""), fallback=idx)
+                    nro_documento = limpiar_dni(row.get("nro_documento", row.get("dni", "")))
                     nombres = limpiar_texto(row.get("nombres", ""))
                     apellido_paterno = limpiar_texto(
                         row.get("apellido paterno", row.get("apelido paterno", ""))
                     )
                     apellido_materno = limpiar_texto(row.get("apellido materno", ""))
 
-                    print(f"\n[{contador}/{len(disponibles_validar)}] ID={id_registro} | DNI={dni} | {apellido_paterno}, {nombres}")
+                    print(f"\n[{contador}/{len(disponibles_validar)}] ID={id_registro} | DOC={nro_documento} | {apellido_paterno}, {nombres}")
 
-                    if len(dni) != 8:
-                        print("   DNI invalido, se omite.")
+                    if len(nro_documento) not in (8, 9):
+                        print("   nro_documento invalido (debe tener 8 o 9 digitos), se omite.")
                         continue
 
                     try:
@@ -1008,8 +1058,10 @@ def procesar_validacion_acceso():
 
                     page.wait_for_timeout(180)
 
+                    tipo_doc_registro = str(row.get("tipo_doc", "DNI") or "DNI").strip().upper()
+
                     clasificacion, detalle_resultado = validar_acceso_inscripcion(
-                        page, dni, nombres, apellido_paterno, apellido_materno
+                        page, nro_documento, nombres, apellido_paterno, apellido_materno, tipo_doc=tipo_doc_registro
                     )
 
                     # Aplicar mapeo de resultados
@@ -1018,8 +1070,13 @@ def procesar_validacion_acceso():
                         detalle_nuevo = MAPEO_RESULTADOS[clasificacion]["detalle"]
                         
                         if ESCRIBIR_EXCEL:
-                            df.at[idx, "estado"] = estado_nuevo
-                            df.at[idx, "detalle_validacion"] = detalle_nuevo
+                            mascara_id = df["id"].astype(str).str.strip() == str(id_registro)
+                            if mascara_id.any():
+                                df.loc[mascara_id, "estado"] = estado_nuevo
+                                df.loc[mascara_id, "detalle_validacion"] = detalle_nuevo
+                            else:
+                                df.at[idx, "estado"] = estado_nuevo
+                                df.at[idx, "detalle_validacion"] = detalle_nuevo
                             guardar_progreso_excel(df, idx)
                         
                         if clasificacion == "CUENTA_ACTIVA":
@@ -1053,7 +1110,7 @@ def procesar_validacion_acceso():
                         pestana_cerrada = True
                         print("Se cerro la pestaña durante la validacion. Flujo detenido.")
                         break
-                    print(f"Error en registro ID={id_registro} DNI={dni}: {e}")
+                    print(f"Error en registro ID={id_registro} DOC={nro_documento}: {e}")
 
         finally:
             try:
@@ -1068,6 +1125,7 @@ def procesar_validacion_acceso():
     if ESCRIBIR_EXCEL:
         print("\n✅ Guardando cambios en Excel...")
         try:
+            df = limpiar_tildes_dataframe(df)
             df.to_excel(EXCEL_NORMALIZADO, index=False)
             print(f"✅ Excel actualizado correctamente: {EXCEL_NORMALIZADO}")
             print(f"   Estados y detalles validación se han inscrito en el archivo")
